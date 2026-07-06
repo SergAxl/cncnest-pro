@@ -98,6 +98,13 @@ function parseDXF(text, tol = 1.0) {
   // Fast-forward to ENTITIES section
   let gi = 0;
   while (gi < G.length && !(G[gi][0]===2 && G[gi][1]==='ENTITIES')) gi++;
+
+  // Collect entity types for diagnostics
+  const foundTypes = new Set();
+  for (let k = gi; k < G.length; k++)
+    if (G[k][0] === 0 && G[k][1] !== 'ENDSEC' && G[k][1] !== 'EOF')
+      foundTypes.add(G[k][1]);
+
   gi++;
 
   const shapes = [];
@@ -117,15 +124,19 @@ function parseDXF(text, tol = 1.0) {
         if (c===70) flags = +v;
         if (c===10) { xs.push(+v); bl.push(0); }
         if (c===20) ys.push(+v);
-        if (c===42) bl[bl.length-1] = +v; // bulge for current vertex
+        if (c===42) bl[bl.length-1] = +v;
       }
-      if (xs.length >= 3 && (flags & 1)) { // must be closed
+      // Принимаем: флаг замкнутости ИЛИ геометрически замкнутая (первая ≈ последняя)
+      const geoClosed = xs.length >= 3 &&
+        Math.hypot(xs[0]-xs[xs.length-1], ys[0]-ys[ys.length-1]) < tol * 10;
+      const isClosed = (flags & 1) || geoClosed;
+      if (xs.length >= 3 && isClosed) {
+        const count = (geoClosed && !(flags & 1)) ? xs.length - 1 : xs.length;
         const pts = [];
-        for (let j = 0; j < xs.length; j++) {
+        for (let j = 0; j < count; j++) {
           pts.push({ x:xs[j], y:ys[j] });
           if (Math.abs(bl[j]) > 1e-5) {
             const nj = (j+1) % xs.length;
-            // arc pts, drop last (= next vertex)
             bulgeArcPts(xs[j],ys[j],xs[nj],ys[nj],bl[j],tol)
               .slice(0,-1).forEach(p => pts.push(p));
           }
@@ -135,6 +146,98 @@ function parseDXF(text, tol = 1.0) {
           shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
         }
       }
+      continue;
+    }
+
+    // ── POLYLINE / VERTEX (формат R12) ─────────────────────
+    if (etype === 'POLYLINE') {
+      let layer='0', flags=0;
+      while (gi < G.length && G[gi][0] !== 0) {
+        const [c,v] = G[gi++];
+        if (c===8)  layer=v;
+        if (c===70) flags=+v;
+      }
+      const verts = [];
+      while (gi < G.length) {
+        if (G[gi][0] !== 0)          { gi++; continue; }
+        if (G[gi][1] === 'SEQEND')   { gi++; break; }
+        if (G[gi][1] !== 'VERTEX')   { break; }
+        gi++;
+        let vx=0, vy=0, vb=0, vf=0;
+        while (gi < G.length && G[gi][0] !== 0) {
+          const [c,v] = G[gi++];
+          if (c===10) vx=+v;
+          if (c===20) vy=+v;
+          if (c===42) vb=+v;
+          if (c===70) vf=+v;
+        }
+        if (!(vf & 16)) verts.push({ x:vx, y:vy, b:vb }); // пропуск mesh-вершин
+      }
+      const geoCl2 = verts.length >= 3 &&
+        Math.hypot(verts[0].x-verts[verts.length-1].x,
+                   verts[0].y-verts[verts.length-1].y) < tol * 10;
+      if (verts.length >= 3 && ((flags & 1) || geoCl2)) {
+        const count = (geoCl2 && !(flags & 1)) ? verts.length - 1 : verts.length;
+        const out = [];
+        for (let j = 0; j < count; j++) {
+          out.push({ x:verts[j].x, y:verts[j].y });
+          if (Math.abs(verts[j].b) > 1e-5) {
+            const nj = (j+1) % verts.length;
+            bulgeArcPts(verts[j].x,verts[j].y,verts[nj].x,verts[nj].y,verts[j].b,tol)
+              .slice(0,-1).forEach(p => out.push(p));
+          }
+        }
+        if (out.length >= 3) {
+          const n = normPoly(out), bb = getBBox(n);
+          shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
+        }
+      }
+      continue;
+    }
+
+    // ── SPLINE ─────────────────────────────────────────────
+    // Fit points (11/21) — точки НА кривой, приоритет над control points.
+    // Для замкнутых B-Spline control points образуют корректный контур.
+    if (etype === 'SPLINE') {
+      let layer='0', flags=0, degree=3;
+      const ctrlX=[], ctrlY=[], fitX=[], fitY=[];
+      while (gi < G.length && G[gi][0] !== 0) {
+        const [c,v] = G[gi++];
+        if (c===8)  layer=v;
+        if (c===70) flags=+v;
+        if (c===71) degree=+v;
+        if (c===10) ctrlX.push(+v);
+        if (c===20) ctrlY.push(+v);
+        if (c===11) fitX.push(+v);
+        if (c===21) fitY.push(+v);
+      }
+      let rawPts = [];
+      if (fitX.length >= 3 && fitX.length === fitY.length) {
+        rawPts = fitX.map((x,i) => ({ x, y: fitY[i] }));
+      } else if (ctrlX.length >= 3 && ctrlX.length === ctrlY.length) {
+        rawPts = ctrlX.map((x,i) => ({ x, y: ctrlY[i] }));
+      }
+      if (rawPts.length < 3) continue;
+      const spClosed = (flags & 1) !== 0;
+      const d0 = Math.hypot(rawPts[0].x - rawPts[rawPts.length-1].x,
+                            rawPts[0].y - rawPts[rawPts.length-1].y);
+      const geoClSp = d0 < tol * 10;
+      if (!spClosed && !geoClSp) continue; // открытая сплайн — не раскройный контур
+      if (geoClSp && rawPts.length > 3) rawPts = rawPts.slice(0, -1);
+      const n = normPoly(rawPts), bb = getBBox(n);
+      shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
+      continue;
+    }
+
+    // ── ARC (незамкнутый, пропуск — только для info) ───────
+    if (etype === 'ARC') {
+      while (gi < G.length && G[gi][0] !== 0) gi++;
+      continue;
+    }
+
+    // ── LINE (незамкнутый, пропуск) ────────────────────────
+    if (etype === 'LINE') {
+      while (gi < G.length && G[gi][0] !== 0) gi++;
       continue;
     }
 
@@ -188,7 +291,7 @@ function parseDXF(text, tol = 1.0) {
     // Skip unknown entity body
     while (gi < G.length && G[gi][0] !== 0) gi++;
   }
-  return shapes;
+  return { shapes, foundTypes };
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -680,14 +783,33 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = e => {
       try {
-        const shapes = parseDXF(e.target.result, arcTol);
+        const { shapes, foundTypes } = parseDXF(e.target.result, arcTol);
         if (!shapes.length) {
-          alert("В файле не найдено замкнутых контуров.\nПоддерживаются: LWPOLYLINE (закрытая), CIRCLE, ELLIPSE.");
+          const supported = ['LWPOLYLINE','POLYLINE','SPLINE','CIRCLE','ELLIPSE'];
+          const found = [...foundTypes].filter(t => t !== 'VERTEX' && t !== 'SEQEND');
+          const unsupported = found.filter(t => !supported.includes(t));
+          let msg = "В файле не найдено замкнутых контуров.\n\n";
+          if (found.length) {
+            msg += `Найдены объекты: ${found.join(', ')}\n\n`;
+          }
+          msg += "Поддерживаются:\n";
+          msg += "• LWPOLYLINE — закрытая (флаг или геометрически)\n";
+          msg += "• POLYLINE / VERTEX (R12)\n";
+          msg += "• SPLINE — замкнутая\n";
+          msg += "• CIRCLE, ELLIPSE\n\n";
+          if (unsupported.length) {
+            msg += `Неподдерживаемые: ${unsupported.join(', ')}\n`;
+            msg += "Совет: экспортируйте из CAD в DXF R2010, выбрав 'Экспорт в полилинии'.";
+          } else {
+            msg += "Совет: убедитесь что контуры замкнуты. В AutoCAD/FreeCAD:\n";
+            msg += "PEDIT → Close, или используйте команду JOIN.";
+          }
+          alert(msg);
           return;
         }
         let id = nid;
+        const baseName = file.name.replace(/\.dxf$/i,"");
         const added = shapes.map((s, i) => {
-          const baseName = file.name.replace(/\.dxf$/i,"");
           const name = s.layer && s.layer !== "0" ? s.layer : `${baseName}_${i+1}`;
           return {
             id: id++, name, qty:1, rot:true,
@@ -817,6 +939,7 @@ export default function App() {
       fontFamily:"'Barlow','Helvetica Neue',Helvetica,sans-serif"}}>
 
       <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
         *{box-sizing:border-box}
         input[type=range]{accent-color:#00e5ff}
         input[type=checkbox],input[type=radio]{accent-color:#00e5ff;cursor:pointer}

@@ -1,7 +1,7 @@
 {
   "name": "cncnest-pro",
   "version": "2.0.0",
-  "description": "CNC Nesting Optimizer — оптимизация раскроя листовых материалов",
+  "description": "CNC Nesting Optimizer",
   "main": "electron/main.js",
   "homepage": "./",
   "private": true,
@@ -23,25 +23,12 @@
   "build": {
     "appId":       "com.cncnest.pro",
     "productName": "CNCnest PRO",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**/*",
-      "electron/**/*",
-      "public/**/*"
-    ],
-    "extraMetadata": {
-      "main": "electron/main.js"
-    },
+    "directories": { "output": "release" },
+    "files": [ "dist/**/*", "electron/**/*", "public/**/*" ],
+    "extraMetadata": { "main": "electron/main.js" },
     "win": {
-      "target": [
-        { "target": "portable", "arch": ["x64"] }
-      ],
-      "artifactName": "CNCnest-PRO-${version}-portable.exe"
-    },
-    "portable": {
-      "splashImage": null
+      "target": [{ "target": "portable", "arch": ["x64"] }],
+      "artifactName": "CNCnest-PRO-portable.exe"
     }
   }
 }
