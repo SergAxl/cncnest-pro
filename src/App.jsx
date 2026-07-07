@@ -58,6 +58,52 @@ function normPoly(pts) {
   return pts.map(({x,y}) => ({ x: x-cx, y: -(y-cy) }));
 }
 
+// ── Hole detection helpers ─────────────────────────────────
+function pointInPolygon(px, py, poly) {
+  let inside = false;
+  for (let i=0, j=poly.length-1; i<poly.length; j=i++) {
+    const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y;
+    if ((yi>py) !== (yj>py) && px < (xj-xi)*(py-yi)/(yj-yi)+xi)
+      inside = !inside;
+  }
+  return inside;
+}
+
+function polygonArea(pts) {
+  let a = 0;
+  for (let i=0, j=pts.length-1; i<pts.length; j=i++)
+    a += (pts[j].x+pts[i].x) * (pts[j].y-pts[i].y);
+  return Math.abs(a/2);
+}
+
+// Group contours: inner polygons (holes) are nested inside their parent outer contour.
+// Returns array of {polygon, holes:[...], w, h, layer}
+function groupContours(shapes) {
+  if (!shapes.length) return [];
+  const sorted = shapes
+    .map(s => ({...s, area: polygonArea(s.polygon)}))
+    .sort((a,b) => b.area - a.area);
+  const used = new Set();
+  const result = [];
+  for (let i=0; i<sorted.length; i++) {
+    if (used.has(i)) continue;
+    const outer = sorted[i];
+    const holes = [];
+    for (let j=i+1; j<sorted.length; j++) {
+      if (used.has(j)) continue;
+      const bb = getBBox(sorted[j].polygon);
+      const cx = (bb.x0+bb.x1)/2, cy = (bb.y0+bb.y1)/2;
+      if (pointInPolygon(cx, cy, outer.polygon)) {
+        holes.push(sorted[j].polygon);
+        used.add(j);
+      }
+    }
+    used.add(i);
+    result.push({ polygon:outer.polygon, holes, w:outer.w, h:outer.h, layer:outer.layer });
+  }
+  return result;
+}
+
 // ═══════════════════════════════════════════════════════════
 //  DXF PARSER  (LWPOLYLINE · CIRCLE · ELLIPSE)
 // ═══════════════════════════════════════════════════════════
@@ -301,21 +347,24 @@ function parseDXF(text, tol = 1.0) {
 function buildOrients(angles, part, gap) {
   const seen = new Set(), result = [];
   for (const angle of angles) {
-    let pw, ph, polyPts = null;
+    let pw, ph, polyPts = null, holePts = null;
     if (part.polygon) {
       const rotated = rotPts(part.polygon, angle);
       const bb = getBBox(rotated);
       pw = bb.w; ph = bb.h;
       polyPts = rotated.map(pt => ({ x:pt.x-bb.x0, y:pt.y-bb.y0 }));
+      // Rotate holes with the same angle, offset by the same bbox origin
+      holePts = (part.holes||[]).map(hole =>
+        rotPts(hole, angle).map(pt => ({ x:pt.x-bb.x0, y:pt.y-bb.y0 }))
+      );
     } else {
-      // Rectangle: only 0° / 90° are distinct
       const a = ((angle % 180) + 180) % 180;
       [pw, ph] = (a < 45 || a >= 135) ? [part.w, part.h] : [part.h, part.w];
     }
     const key = `${Math.round(pw*10)}_${Math.round(ph*10)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push({ pw, ph, bw:pw+gap, bh:ph+gap, rot:angle, polyPts });
+    result.push({ pw, ph, bw:pw+gap, bh:ph+gap, rot:angle, polyPts, holePts });
   }
   return result;
 }
@@ -343,7 +392,8 @@ function placeItem(item, sheet, W, H, gap, rotSteps) {
   const { r, o } = best;
   sheet.pl.push({
     iid:item.iid, pid:item.id, name:item.name,
-    x:r.x, y:r.y, pw:o.pw, ph:o.ph, rot:o.rot, ci:item.ci, polyPts:o.polyPts
+    x:r.x, y:r.y, pw:o.pw, ph:o.ph, rot:o.rot, ci:item.ci,
+    polyPts:o.polyPts, holePts:o.holePts
   });
   const rW=r.w-o.bw, rH=r.h-o.bh, nr=[];
   if (rW < rH) {
@@ -410,20 +460,30 @@ function SheetSVG({ data, W, H, sc, labels }) {
         const rLbl = ra > 0 ? ` ${ra}°` : '';
 
         if (p.polyPts) {
-          // ── Polygon (DXF) part ──────────────────────────
-          const pts = p.polyPts
-            .map(pt => `${(p.x+pt.x)*sc},${(p.y+pt.y)*sc}`)
-            .join(' ');
+          // Build compound SVG path: outer contour + holes → fill-rule evenodd
+          const ptToStr = (pt, i) =>
+            `${i===0?'M':'L'}${((p.x+pt.x)*sc).toFixed(2)},${((p.y+pt.y)*sc).toFixed(2)}`;
+          const outerD  = p.polyPts.map(ptToStr).join(' ') + ' Z';
+          const holesD  = (p.holePts||[]).map(hole =>
+            hole.map(ptToStr).join(' ') + ' Z'
+          ).join(' ');
           return (
             <g key={p.iid}>
-              <polygon points={pts}
+              <path d={outerD + ' ' + holesD}
+                fillRule="evenodd"
                 fill={col} fillOpacity={0.18}
                 stroke={col} strokeWidth={1.4}/>
-              {/* ghost bounding box */}
+              {/* Holes: highlight inner contours */}
+              {(p.holePts||[]).map((hole, hi) => (
+                <path key={hi}
+                  d={hole.map(ptToStr).join(' ') + ' Z'}
+                  fill="none" stroke={col} strokeWidth={0.7}
+                  strokeDasharray="3 2" opacity={0.5}/>
+              ))}
               <rect x={bx+1} y={by+1}
                 width={Math.max(0,bw-2)} height={Math.max(0,bh-2)}
                 fill="none" stroke={col} strokeWidth={0.5}
-                strokeDasharray="4 3" opacity={0.22}/>
+                strokeDasharray="4 3" opacity={0.18}/>
               {hasTxt && (
                 <text x={bx+bw/2} y={by+bh/2}
                   textAnchor="middle" dominantBaseline="middle"
@@ -431,6 +491,8 @@ function SheetSVG({ data, W, H, sc, labels }) {
                   fontFamily="'JetBrains Mono','Courier New',monospace"
                   fontWeight={700} fillOpacity={0.9}>
                   {p.name}{rLbl}
+                  {(p.holePts||[]).length>0 &&
+                    <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{(p.holePts||[]).length}</tspan>}
                 </text>
               )}
             </g>
@@ -736,8 +798,14 @@ export default function App() {
   const [rotSteps,setRotSteps]= useState(4);
   const [arcTol,  setArcTol]  = useState(1.0);
   const [expOpen, setExpOpen] = useState(false);
-  const fileRef  = useRef();
-  const expRef   = useRef();
+  const [zoom,    setZoom]    = useState(1);
+  const [panX,    setPanX]    = useState(0);
+  const [panY,    setPanY]    = useState(0);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const fileRef   = useRef();
+  const expRef    = useRef();
+  const canvasRef = useRef();
+  const panRef    = useRef({ active:false, sx:0, sy:0, px:0, py:0 });
 
   useEffect(() => { runCalc(DEMO,2440,1220,3,4); }, []);
   useEffect(() => {
@@ -776,6 +844,54 @@ export default function App() {
   const startEdit  = p  => { setEid(p.id); setForm({name:p.name,w:""+p.w,h:""+p.h,qty:""+p.qty,rot:p.rot}); };
   const cancelEdit = () => { setEid(null); setForm({name:"",w:"",h:"",qty:"1",rot:true}); };
   const delPart    = id => { setParts(p=>p.filter(x=>x.id!==id)); if(eid===id) cancelEdit(); setDirty(true); };
+  const changeQty  = (id, delta) => {
+    setParts(p => p.map(x => x.id===id ? {...x, qty: Math.max(1, x.qty+delta)} : x));
+    setDirty(true);
+  };
+  const setQtyDirect = (id, val) => {
+    const q = Math.max(1, parseInt(val)||1);
+    setParts(p => p.map(x => x.id===id ? {...x, qty:q} : x));
+    setDirty(true);
+  };
+
+  // ── ZOOM / PAN ───────────────────────────────────────────
+  const resetView = () => { setZoom(1); setPanX(0); setPanY(0); };
+
+  const onCanvasWheel = (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.12 : 0.89;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    setZoom(z => {
+      const nz = Math.max(0.1, Math.min(8, z * factor));
+      const scale = nz / z;
+      setPanX(px => cx - (cx - px) * scale);
+      setPanY(py => cy - (cy - py) * scale);
+      return nz;
+    });
+  };
+
+  const onCanvasMouseDown = (e) => {
+    if (e.button !== 0) return;
+    panRef.current = { active:true, sx:e.clientX, sy:e.clientY, px:panX, py:panY };
+  };
+  const onCanvasMouseMove = (e) => {
+    if (!panRef.current.active) return;
+    setPanX(panRef.current.px + (e.clientX - panRef.current.sx));
+    setPanY(panRef.current.py + (e.clientY - panRef.current.sy));
+  };
+  const onCanvasMouseUp = () => { panRef.current.active = false; };
+
+  // ── DRAG & DROP DXF ─────────────────────────────────────
+  const onDragOver = (e) => { e.preventDefault(); setIsDraggingOver(true); };
+  const onDragLeave = () => setIsDraggingOver(false);
+  const onDrop = (e) => {
+    e.preventDefault(); setIsDraggingOver(false);
+    const files = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.dxf'));
+    if (!files.length) { alert("Перетащите файлы .dxf"); return; }
+    files.forEach(handleDXFFile);
+  };
 
   // ── DXF IMPORT ──────────────────────────────────────────
   function handleDXFFile(file) {
@@ -789,33 +905,28 @@ export default function App() {
           const found = [...foundTypes].filter(t => t !== 'VERTEX' && t !== 'SEQEND');
           const unsupported = found.filter(t => !supported.includes(t));
           let msg = "В файле не найдено замкнутых контуров.\n\n";
-          if (found.length) {
-            msg += `Найдены объекты: ${found.join(', ')}\n\n`;
-          }
-          msg += "Поддерживаются:\n";
-          msg += "• LWPOLYLINE — закрытая (флаг или геометрически)\n";
-          msg += "• POLYLINE / VERTEX (R12)\n";
-          msg += "• SPLINE — замкнутая\n";
-          msg += "• CIRCLE, ELLIPSE\n\n";
+          if (found.length) msg += `Найдены объекты: ${found.join(', ')}\n\n`;
+          msg += "Поддерживаются:\n• LWPOLYLINE (замкн.) · POLYLINE/VERTEX · SPLINE · CIRCLE · ELLIPSE\n\n";
           if (unsupported.length) {
             msg += `Неподдерживаемые: ${unsupported.join(', ')}\n`;
-            msg += "Совет: экспортируйте из CAD в DXF R2010, выбрав 'Экспорт в полилинии'.";
+            msg += "Совет: экспортируйте в DXF R2010 → 'Экспорт в полилинии'.";
           } else {
-            msg += "Совет: убедитесь что контуры замкнуты. В AutoCAD/FreeCAD:\n";
-            msg += "PEDIT → Close, или используйте команду JOIN.";
+            msg += "Совет: убедитесь что контуры замкнуты (PEDIT → Close в AutoCAD).";
           }
-          alert(msg);
-          return;
+          alert(msg); return;
         }
+        // Group outer contours with their holes
+        const grouped = groupContours(shapes);
         let id = nid;
         const baseName = file.name.replace(/\.dxf$/i,"");
-        const added = shapes.map((s, i) => {
+        const added = grouped.map((s, i) => {
           const name = s.layer && s.layer !== "0" ? s.layer : `${baseName}_${i+1}`;
           return {
             id: id++, name, qty:1, rot:true,
             w: Math.round(s.w * 10) / 10,
             h: Math.round(s.h * 10) / 10,
             polygon: s.polygon,
+            holes:   s.holes,
             source: "dxf",
           };
         });
@@ -1058,7 +1169,12 @@ export default function App() {
 
         {/* ── LEFT PANEL ── */}
         <div style={{width:256,...PBG,borderRight:"1px solid #0d2545",
-          display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          display:"flex",flexDirection:"column",overflow:"hidden",
+          outline: isDraggingOver ? "2px solid #00e5ff" : "none",
+          background: isDraggingOver ? "#051420" : PBG.background}}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}>
 
           {/* Sheet params (always visible) */}
           <div style={{padding:"10px 12px",borderBottom:"1px solid #0d2545"}}>
@@ -1104,7 +1220,7 @@ export default function App() {
             <div style={{flex:1,overflowY:"auto",padding:"10px 12px"}}>
 
               {/* Import row */}
-              <div style={{display:"flex",gap:5,marginBottom:8}}>
+              <div style={{display:"flex",gap:5,marginBottom:6}}>
                 <button onClick={()=>fileRef.current.click()}
                   style={{flex:1,background:"#00e5ff0a",border:"1px solid #00e5ff33",
                     color:"#00e5ff",borderRadius:2,padding:"5px 6px",cursor:"pointer",
@@ -1121,7 +1237,18 @@ export default function App() {
                 <button onClick={addDemoPolygons} title="Добавить демо-формы"
                   style={{background:"#a78bfa0a",border:"1px solid #a78bfa33",
                     color:"#a78bfa",borderRadius:2,padding:"5px 7px",cursor:"pointer",
-                    fontSize:13}} >⬡</button>
+                    fontSize:13}}>⬡</button>
+              </div>
+              {/* Drag & drop hint */}
+              <div style={{
+                border:`1px dashed ${isDraggingOver?"#00e5ff":"#0d2545"}`,
+                borderRadius:3, padding:"5px 8px", marginBottom:8,
+                textAlign:"center", fontSize:9, color:"#1a3a5c",
+                fontFamily:"'JetBrains Mono',monospace",
+                background: isDraggingOver?"#00e5ff0a":"transparent",
+                transition:"all .15s",
+              }}>
+                {isDraggingOver ? "⬇ Отпустите DXF файлы…" : "↑ или перетащите .dxf сюда"}
               </div>
 
               <span style={CAP}>◈ ДЕТАЛИ [{parts.length}]</span>
@@ -1144,15 +1271,37 @@ export default function App() {
                       <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
                         fontSize:13,color:"#b8d4ee",overflow:"hidden",
                         textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                        {p.source==="dxf" && <span style={{fontSize:9,color:"#a78bfa",marginRight:3}}>DXF</span>}
+                        {p.source==="dxf"  && <span style={{fontSize:9,color:"#a78bfa",marginRight:3}}>DXF</span>}
                         {p.source==="demo" && <span style={{fontSize:9,color:"#f59e0b",marginRight:3}}>⬡</span>}
                         {p.name}
                       </div>
-                      <div style={{fontFamily:"'JetBrains Mono',monospace",
-                        fontSize:9,color:"#1a3a5c",marginTop:1}}>
-                        {Math.round(p.w)}×{Math.round(p.h)} мм ×{p.qty}
-                        {p.rot    && <span style={{color:"#00e5ff44",marginLeft:3}}>⟳</span>}
-                        {p.polygon && <span style={{color:"#a78bfa44",marginLeft:3}}>⬡</span>}
+                      <div style={{display:"flex",alignItems:"center",gap:4,marginTop:2}}>
+                        <span style={{fontFamily:"'JetBrains Mono',monospace",
+                          fontSize:9,color:"#1a3a5c"}}>
+                          {Math.round(p.w)}×{Math.round(p.h)}мм
+                          {p.rot     && <span style={{color:"#00e5ff44",marginLeft:3}}>⟳</span>}
+                          {p.polygon && <span style={{color:"#a78bfa44",marginLeft:3}}>⬡</span>}
+                          {(p.holes||[]).length>0 && <span style={{color:"#f59e0b44",marginLeft:3}}>⌀{p.holes.length}</span>}
+                        </span>
+                        {/* Inline qty editor */}
+                        <div style={{display:"flex",alignItems:"center",
+                          marginLeft:"auto",gap:2}}>
+                          <button
+                            onClick={e=>{e.stopPropagation();changeQty(p.id,-1);}}
+                            style={{background:"#0d2545",border:"none",color:"#4a8ab5",
+                              borderRadius:2,width:16,height:16,fontSize:11,
+                              cursor:"pointer",lineHeight:"1",padding:0}}>−</button>
+                          <input type="number" min="1" value={p.qty}
+                            onChange={e=>setQtyDirect(p.id, e.target.value)}
+                            onClick={e=>e.stopPropagation()}
+                            style={{...inp({width:32,textAlign:"center",
+                              padding:"1px 3px",fontSize:10})}}/>
+                          <button
+                            onClick={e=>{e.stopPropagation();changeQty(p.id,+1);}}
+                            style={{background:"#0d2545",border:"none",color:"#4a8ab5",
+                              borderRadius:2,width:16,height:16,fontSize:11,
+                              cursor:"pointer",lineHeight:"1",padding:0}}>+</button>
+                        </div>
                       </div>
                     </div>
                     <button onClick={()=>startEdit(p)}
@@ -1350,19 +1499,51 @@ export default function App() {
                 <input type="checkbox" checked={labels} onChange={e=>setLabels(e.target.checked)}/>
                 LBL
               </label>
-              <span style={{fontSize:10,color:"#1a3a5c",fontFamily:"'JetBrains Mono',monospace"}}>SC:</span>
-              <input type="range" min={0.06} max={0.52} step={0.01}
-                value={sc} onChange={e=>setSc(+e.target.value)} style={{width:62}}/>
-              <span style={{fontFamily:"'JetBrains Mono',monospace",
-                fontSize:9,color:"#1a3a5c",minWidth:30}}>
-                1:{Math.round(1/sc)}
+              <div style={{width:1,height:16,background:"#0d2545"}}/>
+              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
+                color:"#00e5ff88",minWidth:42}}>
+                {(zoom*100).toFixed(0)}%
               </span>
+              <button onClick={resetView}
+                style={{background:"none",border:"1px solid #0d2545",color:"#1e6fa8",
+                  borderRadius:2,padding:"1px 7px",cursor:"pointer",fontSize:10,
+                  fontFamily:"'JetBrains Mono',monospace"}}>
+                ⟲ RESET
+              </button>
             </div>
           )}
 
-          {/* Canvas viewport */}
-          <div style={{flex:1,overflow:"auto",display:"flex",alignItems:"center",
-            justifyContent:"center",padding:16,background:"#020a14"}}>
+          {/* Canvas viewport — zoom with wheel, pan with drag */}
+          <div ref={canvasRef}
+            style={{flex:1, overflow:"hidden", background:"#020a14",
+              cursor: panRef.current?.active ? "grabbing" : "grab",
+              position:"relative", userSelect:"none"}}
+            onWheel={onCanvasWheel}
+            onMouseDown={onCanvasMouseDown}
+            onMouseMove={onCanvasMouseMove}
+            onMouseUp={onCanvasMouseUp}
+            onMouseLeave={onCanvasMouseUp}>
+
+            {/* Zoom hint */}
+            {show && (
+              <div style={{position:"absolute",bottom:8,right:12,zIndex:10,
+                fontFamily:"'JetBrains Mono',monospace",fontSize:8,
+                color:"#0d2545",pointerEvents:"none"}}>
+                🖱 колесо — зум · перетащить — пан
+              </div>
+            )}
+
+            {/* Transformed content layer */}
+            <div style={{
+              position:"absolute", top:0, left:0,
+              transform:`translate(${panX}px,${panY}px) scale(${zoom})`,
+              transformOrigin:"0 0",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              width:"100%", height:"100%",
+              pointerEvents:"none",
+            }}>
+              <div style={{pointerEvents:"none"}}>
+
 
             {busy ? (
               <div style={{textAlign:"center"}}>
@@ -1431,7 +1612,9 @@ export default function App() {
             ) : curSh ? (
               <SheetSVG data={curSh} W={W} H={H} sc={sc} labels={labels}/>
             ) : null}
-          </div>
+              </div>
+            </div>{/* /transform layer */}
+          </div>{/* /canvas viewport */}
         </div>
 
         {/* ── RIGHT PANEL ── */}

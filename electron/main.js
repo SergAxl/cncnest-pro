@@ -8,9 +8,7 @@ function createWindow() {
   })
   win.loadFile(path.join(__dirname, '../dist/index.html'))
   win.once('ready-to-show', () => { win.show(); win.focus() })
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url); return { action: 'deny' }
-  })
+  win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action:'deny' } })
 }
 app.whenReady().then(() => {
   createWindow()

@@ -1,30 +1,27 @@
 {
   "name": "cncnest-pro",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "CNC Nesting Optimizer",
   "main": "electron/main.js",
   "homepage": "./",
   "private": true,
   "scripts": {
-    "dev":            "vite",
-    "build":          "vite build",
+    "dev": "vite",
+    "build": "vite build",
     "electron:build": "vite build && electron-builder"
   },
-  "dependencies": {
-    "react":     "^18.3.0",
-    "react-dom": "^18.3.0"
-  },
+  "dependencies": { "react": "^18.3.0", "react-dom": "^18.3.0" },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.0",
-    "vite":               "^5.2.0",
-    "electron":           "^30.0.0",
-    "electron-builder":   "^24.13.0"
+    "vite": "^5.2.0",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.0"
   },
   "build": {
-    "appId":       "com.cncnest.pro",
+    "appId": "com.cncnest.pro",
     "productName": "CNCnest PRO",
     "directories": { "output": "release" },
-    "files": [ "dist/**/*", "electron/**/*", "public/**/*" ],
+    "files": ["dist/**/*","electron/**/*","public/**/*"],
     "extraMetadata": { "main": "electron/main.js" },
     "win": {
       "target": [{ "target": "portable", "arch": ["x64"] }],
