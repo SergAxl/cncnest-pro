@@ -76,38 +76,97 @@ function polygonArea(pts) {
   return Math.abs(a/2);
 }
 
-// Group contours: inner polygons (holes) are nested inside their parent outer contour.
-// Returns array of {polygon, holes:[...], w, h, layer}
+// Evaluate a CLOSED PERIODIC cubic B-spline at numPts uniform samples.
+// Uses the uniform cubic B-spline basis (Catmull-Rom variant).
+// Works for any number of control points n ≥ 4.
+function evalClosedBSpline3(ctrlPts, numPts) {
+  const n = ctrlPts.length;
+  const out = [];
+  for (let s = 0; s < numPts; s++) {
+    const t  = s / numPts;        // parameter in [0, 1)
+    const fn = t * n;
+    const k  = Math.floor(fn);
+    const u  = fn - k;            // local parameter in [0, 1)
+    const u2 = u * u, u3 = u2 * u;
+    // Uniform cubic B-spline basis functions
+    const b0 = (1 - 3*u + 3*u2 - u3) / 6;
+    const b1 = (4 - 6*u2 + 3*u3) / 6;
+    const b2 = (1 + 3*u + 3*u2 - 3*u3) / 6;
+    const b3 = u3 / 6;
+    // Wrap indices for periodic spline
+    const p0 = ctrlPts[(k + n - 1) % n];
+    const p1 = ctrlPts[ k          % n];
+    const p2 = ctrlPts[(k + 1)     % n];
+    const p3 = ctrlPts[(k + 2)     % n];
+    out.push({
+      x: b0*p0.x + b1*p1.x + b2*p2.x + b3*p3.x,
+      y: b0*p0.y + b1*p1.y + b2*p2.y + b3*p3.y,
+    });
+  }
+  return out;
+}
+
+// Decimate polygon if too many points (for rendering performance)
+function decimatePoly(pts, maxPts = 200) {
+  if (pts.length <= maxPts) return pts;
+  const step = Math.ceil(pts.length / maxPts);
+  return pts.filter((_, i) => i % step === 0);
+}
+
+// Group contours: inner polygons (holes) are nested inside their parent.
+// Groups by LAYER first to limit O(n²) scope.
+// Returns array of {polygon, holes, w, h, layer}
 function groupContours(shapes) {
   if (!shapes.length) return [];
-  const sorted = shapes
-    .map(s => ({...s, area: polygonArea(s.polygon)}))
-    .sort((a,b) => b.area - a.area);
-  const used = new Set();
+
+  // Step 1: group by layer
+  const byLayer = {};
+  for (const s of shapes) {
+    const l = s.layer || '0';
+    if (!byLayer[l]) byLayer[l] = [];
+    byLayer[l].push({...s, area: polygonArea(s.polygon)});
+  }
+
   const result = [];
-  for (let i=0; i<sorted.length; i++) {
-    if (used.has(i)) continue;
-    const outer = sorted[i];
-    const holes = [];
-    for (let j=i+1; j<sorted.length; j++) {
-      if (used.has(j)) continue;
-      const bb = getBBox(sorted[j].polygon);
-      const cx = (bb.x0+bb.x1)/2, cy = (bb.y0+bb.y1)/2;
-      if (pointInPolygon(cx, cy, outer.polygon)) {
-        holes.push(sorted[j].polygon);
-        used.add(j);
+
+  for (const layer of Object.keys(byLayer)) {
+    // Sort largest → smallest (outer contours come first)
+    const group = byLayer[layer].sort((a,b) => b.area - a.area);
+    // Cap per-layer shapes to avoid O(n²) hang
+    const capped = group.length > 200 ? group.slice(0, 200) : group;
+
+    const used = new Set();
+
+    for (let i = 0; i < capped.length; i++) {
+      if (used.has(i)) continue;
+      const outer = capped[i];
+      const obb   = getBBox(outer.polygon);
+      const holes = [];
+
+      for (let j = i + 1; j < capped.length; j++) {
+        if (used.has(j)) continue;
+        const inner = capped[j];
+        // Quick bbox pre-filter (fast reject)
+        const ibb = getBBox(inner.polygon);
+        if (ibb.x0 < obb.x0-1 || ibb.y0 < obb.y0-1 ||
+            ibb.x1 > obb.x1+1 || ibb.y1 > obb.y1+1) continue;
+        // Centroid containment test
+        const cx = (ibb.x0+ibb.x1)/2, cy = (ibb.y0+ibb.y1)/2;
+        if (pointInPolygon(cx, cy, outer.polygon)) {
+          holes.push(inner.polygon);
+          used.add(j);
+        }
       }
+      used.add(i);
+
+      // Normalize: shift outer+holes by outer's bbox center
+      const ocx  = (obb.x0+obb.x1)/2, ocy = (obb.y0+obb.y1)/2;
+      const shft = ({x,y}) => ({x:x-ocx, y:y-ocy});
+      const nPoly  = outer.polygon.map(shft);
+      const nHoles = holes.map(h => h.map(shft));
+      const nBB    = getBBox(nPoly);
+      result.push({ polygon:nPoly, holes:nHoles, w:nBB.w, h:nBB.h, layer });
     }
-    used.add(i);
-    // ── Normalize: shift outer+holes together using outer's bbox center
-    // This preserves the relative position of holes inside the outer contour
-    const obb  = getBBox(outer.polygon);
-    const ocx  = (obb.x0+obb.x1)/2, ocy = (obb.y0+obb.y1)/2;
-    const shft = ({x,y}) => ({ x:x-ocx, y:y-ocy });
-    const nPoly  = outer.polygon.map(shft);
-    const nHoles = holes.map(h => h.map(shft));
-    const nBB    = getBBox(nPoly);
-    result.push({ polygon:nPoly, holes:nHoles, w:nBB.w, h:nBB.h, layer:outer.layer });
   }
   return result;
 }
@@ -251,8 +310,8 @@ function parseDXF(text, tol = 1.0) {
     }
 
     // ── SPLINE ─────────────────────────────────────────────
-    // Fit points (11/21) — точки НА кривой, приоритет над control points.
-    // Для замкнутых B-Spline control points образуют корректный контур.
+    // Priority: fit points (code 11/21) → on-curve, use directly.
+    // Fallback:  periodic closed → evaluate as uniform cubic B-spline.
     if (etype === 'SPLINE') {
       let layer='0', flags=0, degree=3;
       const ctrlX=[], ctrlY=[], fitX=[], fitY=[];
@@ -266,20 +325,33 @@ function parseDXF(text, tol = 1.0) {
         if (c===11) fitX.push(+v);
         if (c===21) fitY.push(+v);
       }
+      const spClosed   = (flags & 1) !== 0;
+      const spPeriodic = (flags & 2) !== 0;
       let rawPts = [];
       if (fitX.length >= 3 && fitX.length === fitY.length) {
         rawPts = fitX.map((x,i) => ({ x, y: fitY[i] }));
       } else if (ctrlX.length >= 3 && ctrlX.length === ctrlY.length) {
-        rawPts = ctrlX.map((x,i) => ({ x, y: ctrlY[i] }));
+        const ctrl = ctrlX.map((x,i) => ({ x, y: ctrlY[i] }));
+        if (spPeriodic && ctrl.length >= 4) {
+          // Evaluate as uniform periodic cubic B-spline for smooth curve
+          const numPts = Math.min(128, Math.max(32, ctrl.length * 2));
+          rawPts = evalClosedBSpline3(ctrl, numPts);
+        } else {
+          rawPts = ctrl;
+        }
       }
       if (rawPts.length < 3) continue;
-      const spClosed = (flags & 1) !== 0;
-      const d0 = Math.hypot(rawPts[0].x - rawPts[rawPts.length-1].x,
-                            rawPts[0].y - rawPts[rawPts.length-1].y);
-      const geoClSp = d0 < tol * 10;
-      if (!spClosed && !geoClSp) continue; // открытая сплайн — не раскройный контур
-      if (geoClSp && rawPts.length > 3) rawPts = rawPts.slice(0, -1);
-      const n = rawPts.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
+      const d0 = Math.hypot(rawPts[0].x-rawPts[rawPts.length-1].x,
+                            rawPts[0].y-rawPts[rawPts.length-1].y);
+      const geoClSp = d0 < Math.max(tol*10, 1.0);
+      if (!spClosed && !spPeriodic && !geoClSp) continue;
+      if (geoClSp && rawPts.length > 3) rawPts = rawPts.slice(0,-1);
+      // Min size filter — skip annotation symbols & dimension marks
+      const tmpBB = getBBox(rawPts);
+      if (tmpBB.w < 5 || tmpBB.h < 5) continue;
+      if (polygonArea(rawPts) < 50) continue;
+      const n = decimatePoly(rawPts.map(({x,y}) => ({x, y:-y})));
+      const bb = getBBox(n);
       shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
       continue;
     }
@@ -829,7 +901,7 @@ export default function App() {
   const [nid,     setNid]     = useState(5);
   const [form,    setForm]    = useState({ name:"", w:"", h:"", qty:"1", rot:true });
   const [eid,     setEid]     = useState(null);
-  const [tab,     setTab]     = useState("parts");   // "parts" | "settings"
+  const [tab,     setTab]     = useState("parts");
   const [rotSteps,setRotSteps]= useState(4);
   const [arcTol,  setArcTol]  = useState(1.0);
   const [expOpen, setExpOpen] = useState(false);
@@ -837,6 +909,12 @@ export default function App() {
   const [panX,    setPanX]    = useState(0);
   const [panY,    setPanY]    = useState(0);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  // Custom sheet sizes — persisted to localStorage in Electron
+  const [customSheets, setCustomSheets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('cncnest_sheets') || '[]'); }
+    catch { return []; }
+  });
+  const [customForm, setCustomForm] = useState({ n:"", w:"", h:"" });
   const fileRef   = useRef();
   const expRef    = useRef();
   const canvasRef = useRef();
@@ -891,6 +969,22 @@ export default function App() {
 
   // ── ZOOM / PAN ───────────────────────────────────────────
   const resetView = () => { setZoom(1); setPanX(0); setPanY(0); };
+
+  // ── CUSTOM SHEET SIZES ───────────────────────────────────
+  const addCustomSheet = () => {
+    const w = +customForm.w, h = +customForm.h;
+    if (!w || !h || w < 50 || h < 50) return;
+    const name = customForm.n.trim() || `${w} × ${h} мм`;
+    const updated = [...customSheets, { n:name, w, h }];
+    setCustomSheets(updated);
+    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
+    setCustomForm({ n:"", w:"", h:"" });
+  };
+  const removeCustomSheet = (idx) => {
+    const updated = customSheets.filter((_,i) => i !== idx);
+    setCustomSheets(updated);
+    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
+  };
 
   const onCanvasWheel = (e) => {
     e.preventDefault();
@@ -1214,10 +1308,23 @@ export default function App() {
           {/* Sheet params (always visible) */}
           <div style={{padding:"10px 12px",borderBottom:"1px solid #0d2545"}}>
             <span style={CAP}>◈ ПАРАМЕТРЫ ЛИСТА</span>
-            <select onChange={e=>{const s=STD_SHEETS.find(x=>x.n===e.target.value);if(s)setSheet(s.w,s.h);}}
+            <select onChange={e=>{
+                const all = [...STD_SHEETS, ...customSheets];
+                const s = all.find(x=>x.n===e.target.value);
+                if(s) setSheet(s.w, s.h);
+              }}
               style={inp({width:"100%",marginBottom:6,cursor:"pointer"})}>
-              <option value="">— Стандартный формат —</option>
-              {STD_SHEETS.map(s=><option key={s.n}>{s.n}</option>)}
+              <option value="">— Выберите формат —</option>
+              {customSheets.length > 0 && (
+                <optgroup label="── Мои форматы ──">
+                  {customSheets.map((s,i) => (
+                    <option key={`c${i}`}>{s.n}</option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="── Стандартные ──">
+                {STD_SHEETS.map(s=><option key={s.n}>{s.n}</option>)}
+              </optgroup>
             </select>
             <div style={{display:"flex",gap:5,marginBottom:5}}>
               {[["Ширина [мм]",W,v=>setSheet(+v,H)],["Высота [мм]",H,v=>setSheet(W,+v)]].map(([l,v,fn])=>(
@@ -1234,6 +1341,41 @@ export default function App() {
                   style={inp({width:44})}/>
               </div>
             </div>
+            {/* ── Add current size to library ── */}
+            <div style={{display:"flex",gap:4,marginTop:4}}>
+              <input placeholder="Название (необязательно)" value={customForm.n}
+                onChange={e=>setCustomForm(f=>({...f,n:e.target.value}))}
+                onKeyDown={e=>e.key==="Enter"&&addCustomSheet()}
+                style={inp({flex:1,fontSize:9,padding:"3px 5px"})}/>
+              <button onClick={addCustomSheet} title="Сохранить текущий размер в библиотеку"
+                style={{background:"#10b98118",border:"1px solid #10b98155",
+                  color:"#10b981",borderRadius:2,padding:"3px 8px",cursor:"pointer",
+                  fontSize:11,fontFamily:"'JetBrains Mono',monospace",fontWeight:700,
+                  whiteSpace:"nowrap"}}
+                onMouseEnter={()=>setCustomForm(f=>({
+                  ...f, w:String(W), h:String(H),
+                  n:f.n||`${W} × ${H} мм`
+                }))}>
+                + СОХРАНИТЬ
+              </button>
+            </div>
+            {/* Custom sheets list */}
+            {customSheets.length > 0 && (
+              <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:3}}>
+                {customSheets.map((s,i) => (
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:2,
+                    background:"#10b98112",border:"1px solid #10b98133",
+                    borderRadius:2,padding:"2px 5px",cursor:"pointer"}}
+                    onClick={()=>setSheet(s.w,s.h)}>
+                    <span style={{fontSize:8,color:"#10b981",
+                      fontFamily:"'JetBrains Mono',monospace"}}>{s.n}</span>
+                    <button onClick={e=>{e.stopPropagation();removeCustomSheet(i);}}
+                      style={{background:"none",border:"none",color:"#ef444466",
+                        cursor:"pointer",fontSize:9,padding:"0 1px",lineHeight:1}}>✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Tab bar */}
@@ -1551,15 +1693,100 @@ export default function App() {
           {/* Canvas viewport — zoom with wheel, pan with drag */}
           <div ref={canvasRef}
             style={{flex:1, overflow:"hidden", background:"#020a14",
-              cursor: panRef.current?.active ? "grabbing" : "grab",
-              position:"relative", userSelect:"none"}}
+              cursor:"grab", position:"relative", userSelect:"none"}}
             onWheel={onCanvasWheel}
             onMouseDown={onCanvasMouseDown}
             onMouseMove={onCanvasMouseMove}
             onMouseUp={onCanvasMouseUp}
             onMouseLeave={onCanvasMouseUp}>
 
-            {/* Zoom hint */}
+            {/* ── BUSY overlay ── */}
+            {busy && (
+              <div style={{position:"absolute",inset:0,zIndex:20,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                background:"#020a14",pointerEvents:"none"}}>
+                <div style={{textAlign:"center"}}>
+                  <div style={{width:160,height:90,border:"1px solid #0d2545",
+                    position:"relative",overflow:"hidden",
+                    margin:"0 auto 14px",background:"#030c18"}}>
+                    {Array.from({length:9},(_,i)=>(
+                      <div key={i} style={{position:"absolute",left:0,right:0,
+                        top:`${i*11}%`,height:1,background:"#0d2545"}}/>
+                    ))}
+                    <div style={{position:"absolute",left:0,right:0,height:2,
+                      background:"linear-gradient(90deg,transparent,#00e5ff,transparent)",
+                      animation:"scan 1.1s linear infinite"}}/>
+                  </div>
+                  <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,
+                    color:"#00e5ff",animation:"blink 1.1s infinite"}}>
+                    OPTIMIZING · {rotSteps} STEPS · {parts.reduce((s,p)=>s+p.qty,0)} PARTS…
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ── DIRTY overlay — button must receive clicks → NO pointerEvents:none ── */}
+            {!busy && dirty && res && (
+              <div style={{position:"absolute",inset:0,zIndex:20,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                background:"#020a1aee"}}>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:28,marginBottom:10,color:"#f59e0b",
+                    animation:"blink 1.5s infinite"}}>⚠</div>
+                  <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
+                    fontSize:18,color:"#f59e0b",letterSpacing:"0.06em",marginBottom:14}}>
+                    ПАРАМЕТРЫ ИЗМЕНЕНЫ
+                  </div>
+                  <button
+                    onClick={e => { e.stopPropagation(); doCalc(); }}
+                    style={{background:"#f59e0b0e",border:"1px solid #f59e0b",
+                      color:"#f59e0b",borderRadius:3,padding:"10px 32px",cursor:"pointer",
+                      fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
+                      fontSize:17,letterSpacing:"0.08em"}}>
+                    ▶ ПЕРЕСЧИТАТЬ
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* ── EMPTY overlay ── */}
+            {!busy && !res && (
+              <div style={{position:"absolute",inset:0,zIndex:20,
+                display:"flex",alignItems:"center",justifyContent:"center",
+                pointerEvents:"none"}}>
+                <div style={{textAlign:"center",pointerEvents:"auto"}}>
+                  <div style={{width:76,height:76,border:"1px solid #0d2545",
+                    margin:"0 auto 14px",display:"flex",alignItems:"center",
+                    justifyContent:"center"}}>
+                    <svg width={44} height={44} viewBox="0 0 44 44" fill="none">
+                      <rect x={4} y={4} width={36} height={36} stroke="#0d2545" strokeWidth={1.5}/>
+                      <rect x={8}  y={11} width={11} height={15} stroke="#1a3a5c" strokeWidth={1}/>
+                      <rect x={25} y={11} width={11} height={7}  stroke="#1a3a5c" strokeWidth={1}/>
+                      <rect x={25} y={22} width={11} height={10} stroke="#1a3a5c" strokeWidth={1}/>
+                      <rect x={8}  y={29} width={11} height={6}  stroke="#1a3a5c" strokeWidth={1}/>
+                      <polygon points="8,11 19,11 19,21" stroke="#1a3a5c" strokeWidth={0.5} fill="none" strokeDasharray="2 2"/>
+                    </svg>
+                  </div>
+                  <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
+                    fontSize:17,color:"#0d2545",letterSpacing:"0.06em",marginBottom:4}}>
+                    ДОБАВЬТЕ ДЕТАЛИ
+                  </div>
+                  <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#0a1e35"}}>
+                    DXF IMPORT · {rotSteps} ROT.STEPS · GUILLOTINE BSSF
+                  </div>
+                  <button onClick={()=>{setTab("parts");addDemoPolygons();}}
+                    style={{marginTop:12,background:"transparent",
+                      border:"1px solid #a78bfa44",color:"#a78bfa88",
+                      borderRadius:2,padding:"4px 14px",cursor:"pointer",
+                      fontSize:11,fontFamily:"'Barlow Condensed',sans-serif",
+                      fontWeight:600}}>
+                    ⬡ Демо-контуры
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* ── Zoom hint ── */}
             {show && (
               <div style={{position:"absolute",bottom:8,right:12,zIndex:10,
                 fontFamily:"'JetBrains Mono',monospace",fontSize:8,
@@ -1568,87 +1795,17 @@ export default function App() {
               </div>
             )}
 
-            {/* Transformed content layer */}
+            {/* ── Transform layer — ONLY SheetSVG, no pointer events needed ── */}
             <div style={{
-              position:"absolute", top:0, left:0,
+              position:"absolute", top:0, left:0, width:"100%", height:"100%",
               transform:`translate(${panX}px,${panY}px) scale(${zoom})`,
-              transformOrigin:"0 0",
+              transformOrigin:"0 0", pointerEvents:"none",
               display:"flex", alignItems:"center", justifyContent:"center",
-              width:"100%", height:"100%",
-              pointerEvents:"none",
             }}>
-              <div style={{pointerEvents:"none"}}>
-
-
-            {busy ? (
-              <div style={{textAlign:"center"}}>
-                <div style={{width:160,height:90,border:"1px solid #0d2545",
-                  position:"relative",overflow:"hidden",
-                  margin:"0 auto 14px",background:"#030c18"}}>
-                  {Array.from({length:9},(_,i)=>(
-                    <div key={i} style={{position:"absolute",left:0,right:0,
-                      top:`${i*11}%`,height:1,background:"#0d2545"}}/>
-                  ))}
-                  <div style={{position:"absolute",left:0,right:0,height:2,
-                    background:"linear-gradient(90deg,transparent,#00e5ff,transparent)",
-                    animation:"scan 1.1s linear infinite"}}/>
-                </div>
-                <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,
-                  color:"#00e5ff",animation:"blink 1.1s infinite"}}>
-                  OPTIMIZING · {rotSteps} STEPS · {parts.reduce((s,p)=>s+p.qty,0)} PARTS…
-                </div>
-              </div>
-            ) : dirty && res ? (
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:28,marginBottom:10,color:"#f59e0b",
-                  animation:"blink 1.5s infinite"}}>⚠</div>
-                <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
-                  fontSize:18,color:"#f59e0b",letterSpacing:"0.06em",marginBottom:14}}>
-                  ПАРАМЕТРЫ ИЗМЕНЕНЫ
-                </div>
-                <button onClick={doCalc}
-                  style={{background:"#f59e0b0e",border:"1px solid #f59e0b",
-                    color:"#f59e0b",borderRadius:3,padding:"8px 26px",cursor:"pointer",
-                    fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
-                    fontSize:16,letterSpacing:"0.08em"}}>
-                  ▶ ПЕРЕСЧИТАТЬ
-                </button>
-              </div>
-            ) : !res ? (
-              <div style={{textAlign:"center"}}>
-                <div style={{width:76,height:76,border:"1px solid #0d2545",
-                  margin:"0 auto 14px",display:"flex",alignItems:"center",
-                  justifyContent:"center"}}>
-                  <svg width={44} height={44} viewBox="0 0 44 44" fill="none">
-                    <rect x={4} y={4} width={36} height={36} stroke="#0d2545" strokeWidth={1.5}/>
-                    <rect x={8}  y={11} width={11} height={15} stroke="#1a3a5c" strokeWidth={1}/>
-                    <rect x={25} y={11} width={11} height={7}  stroke="#1a3a5c" strokeWidth={1}/>
-                    <rect x={25} y={22} width={11} height={10} stroke="#1a3a5c" strokeWidth={1}/>
-                    <rect x={8}  y={29} width={11} height={6}  stroke="#1a3a5c" strokeWidth={1}/>
-                    <polygon points="8,11 19,11 19,21" stroke="#1a3a5c" strokeWidth={0.5} fill="none" strokeDasharray="2 2"/>
-                  </svg>
-                </div>
-                <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
-                  fontSize:17,color:"#0d2545",letterSpacing:"0.06em",marginBottom:4}}>
-                  ДОБАВЬТЕ ДЕТАЛИ
-                </div>
-                <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#0a1e35"}}>
-                  DXF IMPORT · {rotSteps} ROT.STEPS · GUILLOTINE BSSF
-                </div>
-                <button onClick={()=>{setTab("parts");addDemoPolygons();}}
-                  style={{marginTop:12,background:"transparent",
-                    border:"1px solid #a78bfa44",color:"#a78bfa88",
-                    borderRadius:2,padding:"4px 14px",cursor:"pointer",
-                    fontSize:11,fontFamily:"'Barlow Condensed',sans-serif",
-                    fontWeight:600}}>
-                  ⬡ Демо-контуры
-                </button>
-              </div>
-            ) : curSh ? (
-              <SheetSVG data={curSh} W={W} H={H} sc={sc} labels={labels}/>
-            ) : null}
-              </div>
-            </div>{/* /transform layer */}
+              {show && curSh && (
+                <SheetSVG data={curSh} W={W} H={H} sc={sc} labels={labels}/>
+              )}
+            </div>
           </div>{/* /canvas viewport */}
         </div>
 
