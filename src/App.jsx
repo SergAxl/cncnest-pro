@@ -99,7 +99,15 @@ function groupContours(shapes) {
       }
     }
     used.add(i);
-    result.push({ polygon:outer.polygon, holes, w:outer.w, h:outer.h, layer:outer.layer });
+    // ── Normalize: shift outer+holes together using outer's bbox center
+    // This preserves the relative position of holes inside the outer contour
+    const obb  = getBBox(outer.polygon);
+    const ocx  = (obb.x0+obb.x1)/2, ocy = (obb.y0+obb.y1)/2;
+    const shft = ({x,y}) => ({ x:x-ocx, y:y-ocy });
+    const nPoly  = outer.polygon.map(shft);
+    const nHoles = holes.map(h => h.map(shft));
+    const nBB    = getBBox(nPoly);
+    result.push({ polygon:nPoly, holes:nHoles, w:nBB.w, h:nBB.h, layer:outer.layer });
   }
   return result;
 }
@@ -188,7 +196,8 @@ function parseDXF(text, tol = 1.0) {
           }
         }
         if (pts.length >= 3) {
-          const n = normPoly(pts), bb = getBBox(n);
+          // Y-flip only — NO centering here (groupContours will normalize after hole grouping)
+          const n = pts.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
           shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
         }
       }
@@ -234,7 +243,7 @@ function parseDXF(text, tol = 1.0) {
           }
         }
         if (out.length >= 3) {
-          const n = normPoly(out), bb = getBBox(n);
+          const n = out.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
           shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
         }
       }
@@ -270,7 +279,7 @@ function parseDXF(text, tol = 1.0) {
       const geoClSp = d0 < tol * 10;
       if (!spClosed && !geoClSp) continue; // открытая сплайн — не раскройный контур
       if (geoClSp && rawPts.length > 3) rawPts = rawPts.slice(0, -1);
-      const n = normPoly(rawPts), bb = getBBox(n);
+      const n = rawPts.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
       shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
       continue;
     }
@@ -299,10 +308,10 @@ function parseDXF(text, tol = 1.0) {
         const segs = Math.max(16, Math.ceil(2*Math.PI*r/tol));
         const pts = Array.from({length:segs}, (_,i) => {
           const a = 2*Math.PI*i/segs;
-          return { x: cx+r*Math.cos(a), y: cy+r*Math.sin(a) };
+          return { x: cx+r*Math.cos(a), y: -(cy+r*Math.sin(a)) }; // Y-flip inline
         });
-        const n=normPoly(pts), bb=getBBox(n);
-        shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
+        const bb=getBBox(pts);
+        shapes.push({ polygon:pts, w:bb.w, h:bb.h, layer });
       }
       continue;
     }
@@ -325,11 +334,11 @@ function parseDXF(text, tol = 1.0) {
         const pts = Array.from({length:segs}, (_,i) => {
           const t = sp + sw*i/segs;
           const lx=mR*Math.cos(t), ly=mnR*Math.sin(t);
-          return { x: cx+lx*Math.cos(ang)-ly*Math.sin(ang),
-                   y: cy+lx*Math.sin(ang)+ly*Math.cos(ang) };
+          return { x:  cx+lx*Math.cos(ang)-ly*Math.sin(ang),
+                   y: -(cy+lx*Math.sin(ang)+ly*Math.cos(ang)) }; // Y-flip inline
         });
-        const n=normPoly(pts), bb=getBBox(n);
-        shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
+        const bb=getBBox(pts);
+        shapes.push({ polygon:pts, w:bb.w, h:bb.h, layer });
       }
       continue;
     }
@@ -652,112 +661,138 @@ function generateAllSVG(sheets, W, H) {
 }
 
 // ── DXF ─────────────────────────────────────────────────────
-// AC1015 (R2000) — supports LWPOLYLINE and TEXT.
-// Coordinate transform: y_dxf = H − y_screen  (Y-up DXF convention)
-// Each sheet is offset along X by (W + sheetGap).
-// Layers: SHEET (color 3), per-part layers (color 1), LABELS (color 8).
+// Format: AC1009 (R12) — максимальная совместимость.
+// Не требует subclass-маркеров (100 AcDb…).
+// Контуры: POLYLINE/VERTEX/SEQEND.
+// Отверстия: отдельный слой HOLES (можно скрыть в CAM).
+// Y: screen Y-down → DXF Y-up: y_dxf = H − y_screen.
 function generateDXF(sheets, W, H) {
-  const L = [];
-  const wr = (...args) => args.forEach(a => L.push(String(a)));
-  const sheetGap = 100; // mm
+  const lines = [];
+  // Каждый аргумент — отдельная строка в файле
+  const w = (...args) => args.forEach(a => lines.push(String(a)));
+
+  const sheetGap = 100; // мм между листами по X
 
   // ── HEADER ────────────────────────────────────────────────
-  wr("0","SECTION","2","HEADER");
-  wr("9","$ACADVER","1","AC1015");  // R2000
-  wr("9","$INSUNITS","70","4");    // 4 = millimeters
-  wr("9","$MEASUREMENT","70","1"); // metric
-  wr("0","ENDSEC");
+  w("0","SECTION","2","HEADER");
+  w("9","$ACADVER","1","AC1009");       // R12
+  w("9","$INSUNITS","70","4");          // 4 = мм
+  w("9","$LUNITS","70","2");            // decimal
+  w("9","$MEASUREMENT","70","1");       // metric
+  w("0","ENDSEC");
 
   // ── TABLES ────────────────────────────────────────────────
-  const layerNames = new Set(["0","SHEET","LABELS"]);
-  sheets.forEach(sh => sh.pl.forEach(p => layerNames.add(sanitizeLayer(p.name))));
+  const layerSet = new Set(["0","SHEET","LABELS","HOLES"]);
+  sheets.forEach(sh => sh.pl.forEach(p => layerSet.add(sanitizeLayer(p.name))));
 
-  wr("0","SECTION","2","TABLES");
+  w("0","SECTION","2","TABLES");
 
-  // LTYPE table (only CONTINUOUS needed)
-  wr("0","TABLE","2","LTYPE","70","1");
-  wr("0","LTYPE","2","CONTINUOUS","70","0","3","Solid","72","65","73","0","40","0.0");
-  wr("0","ENDTAB");
+  // LTYPE
+  w("0","TABLE","2","LTYPE","70","1");
+  w("0","LTYPE");
+  w("2","CONTINUOUS","70","0","3","Solid line","72","65","73","0","40","0.0");
+  w("0","ENDTAB");
 
-  // LAYER table
-  wr("0","TABLE","2","LAYER","70",String(layerNames.size));
-  const lyrColor = {"0":7, SHEET:3, LABELS:8};
-  layerNames.forEach(nm => {
-    wr("0","LAYER");
-    wr("2",nm,"70","0","62",String(lyrColor[nm]||1),"6","CONTINUOUS");
+  // LAYER
+  w("0","TABLE","2","LAYER","70",String(layerSet.size));
+  const lyColor = { "0":7, SHEET:3, LABELS:9, HOLES:6 };
+  layerSet.forEach(nm => {
+    w("0","LAYER");
+    w("2",nm);
+    w("70","0");
+    w("62",String(lyColor[nm] != null ? lyColor[nm] : 1));
+    w("6","CONTINUOUS");
   });
-  wr("0","ENDTAB");
-  wr("0","ENDSEC");
+  w("0","ENDTAB");
+
+  w("0","ENDSEC");
 
   // ── ENTITIES ──────────────────────────────────────────────
-  wr("0","SECTION","2","ENTITIES");
+  w("0","SECTION","2","ENTITIES");
 
-  const lwpoly = (layer, pts, closed=true) => {
-    wr("0","LWPOLYLINE");
-    wr("8",layer);
-    wr("90",String(pts.length));
-    wr("70",closed?"1":"0");
-    wr("38","0.0");
-    pts.forEach(([x,y]) => { wr("10",x.toFixed(4)); wr("20",y.toFixed(4)); });
+  // R12 POLYLINE / VERTEX / SEQEND
+  const r12poly = (layer, pts, closed = true) => {
+    w("0","POLYLINE");
+    w("8",layer);
+    w("66","1");                        // vertices follow
+    w("70", closed ? "1" : "0");        // 1 = замкнута
+    pts.forEach(([x,y]) => {
+      w("0","VERTEX");
+      w("8",layer);
+      w("10",x.toFixed(4));
+      w("20",y.toFixed(4));
+      w("30","0.0");
+    });
+    w("0","SEQEND");
+    w("8",layer);
   };
 
-  const dxfText = (layer, x, y, h, txt) => {
-    const safe = txt.replace(/[^\x20-\x7E]/g,"?");
-    wr("0","TEXT","8",layer);
-    wr("10",x.toFixed(4),"20",y.toFixed(4));
-    wr("40",h.toFixed(3),"1",safe);
-    wr("72","1","73","2");        // center H+V
-    wr("11",x.toFixed(4),"21",y.toFixed(4));
+  // R12 TEXT (простой, без выравнивания — самый совместимый вариант)
+  const r12text = (layer, x, y, h, txt) => {
+    // Заменяем не-ASCII (кириллицу) на латинские эквиваленты в метке
+    const safe = txt.replace(/[^\x20-\x7E]/g, "?");
+    if (!safe.trim()) return;
+    w("0","TEXT");
+    w("8",layer);
+    w("10",x.toFixed(4));
+    w("20",y.toFixed(4));
+    w("30","0.0");
+    w("40",h.toFixed(3));
+    w("1",safe);
   };
 
-  // Y-flip helper  (screen Y-down → DXF Y-up)
+  // Y-flip: экранные координаты (Y-вниз) → DXF (Y-вверх)
   const fy = y => H - y;
 
   sheets.forEach((sheet, si) => {
-    const ox = si * (W + sheetGap); // X offset for this sheet
+    const ox = si * (W + sheetGap);
 
-    // Sheet boundary
-    lwpoly("SHEET", [
+    // Граница листа
+    r12poly("SHEET", [
       [ox,    fy(0)],
       [ox+W,  fy(0)],
       [ox+W,  fy(H)],
       [ox,    fy(H)],
     ]);
 
-    // Parts
     for (const p of sheet.pl) {
       const layer = sanitizeLayer(p.name);
-      const ra    = Math.round(p.rot||0);
-      const lbl   = ra > 0 ? `${p.name} ${ra}deg` : p.name;
+      const ra  = Math.round(p.rot || 0);
+      const lbl = ra > 0 ? `${p.name.replace(/[^\x20-\x7E]/g,"?")} ${ra}d` : p.name.replace(/[^\x20-\x7E]/g,"?");
 
       if (p.polyPts) {
-        // Polygon — apply Y-flip to each point
-        lwpoly(layer, p.polyPts.map(pt => [
+        // Внешний контур полигона
+        r12poly(layer, p.polyPts.map(pt => [
           ox + p.x + pt.x,
           fy(p.y + pt.y),
         ]));
+        // Отверстия — отдельный слой HOLES
+        (p.holePts || []).forEach(hole => {
+          r12poly("HOLES", hole.map(pt => [
+            ox + p.x + pt.x,
+            fy(p.y + pt.y),
+          ]));
+        });
       } else {
-        // Rectangle — 4 corners, Y-flipped
-        lwpoly(layer, [
-          [ox+p.x,      fy(p.y)     ],
-          [ox+p.x+p.pw, fy(p.y)     ],
-          [ox+p.x+p.pw, fy(p.y+p.ph)],
-          [ox+p.x,      fy(p.y+p.ph)],
+        // Прямоугольная деталь — 4 угла
+        r12poly(layer, [
+          [ox+p.x,       fy(p.y)      ],
+          [ox+p.x+p.pw,  fy(p.y)      ],
+          [ox+p.x+p.pw,  fy(p.y+p.ph) ],
+          [ox+p.x,       fy(p.y+p.ph) ],
         ]);
       }
 
-      // Text label (on LABELS layer — hide in CAM if needed)
-      const tx = ox + p.x + p.pw/2;
-      const ty = fy(p.y + p.ph/2);
-      const th = Math.max(2.5, Math.min(7, p.ph*0.28, p.pw/(lbl.length*0.65+1)));
-      dxfText("LABELS", tx, ty, th, lbl);
+      // Подпись на слое LABELS (в CAM скрыть этот слой)
+      const th = Math.max(2, Math.min(8, p.ph*0.28, p.pw/(lbl.length*0.65+1)));
+      r12text("LABELS", ox+p.x+p.pw/2, fy(p.y+p.ph/2), th, lbl);
     }
   });
 
-  wr("0","ENDSEC");
-  wr("0","EOF");
+  w("0","ENDSEC");
+  w("0","EOF");
 
-  return L.join("\r\n");
+  return lines.join("\r\n") + "\r\n";
 }
 
 // ═══════════════════════════════════════════════════════════

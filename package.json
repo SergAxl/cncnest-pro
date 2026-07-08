@@ -1,7 +1,6 @@
 {
   "name": "cncnest-pro",
-  "version": "2.1.0",
-  "description": "CNC Nesting Optimizer",
+  "version": "2.2.0",
   "main": "electron/main.js",
   "homepage": "./",
   "private": true,
