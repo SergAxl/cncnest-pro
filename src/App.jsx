@@ -109,20 +109,56 @@ function evalOpenSplineApprox(ctrlPts, isLinear) {
   if (!ctrlPts.length) return [];
   if (isLinear || ctrlPts.length <= 2)
     return [ctrlPts[0], ctrlPts[ctrlPts.length-1]];
-  // Sample control polygon at higher density for curved segments
-  const n = ctrlPts.length;
-  const numPts = Math.min(64, Math.max(n, 8));
-  const out = [];
-  for (let s = 0; s <= numPts; s++) {
-    const t = s / numPts;
-    const fi = t * (n - 1);
-    const i  = Math.min(Math.floor(fi), n - 2);
-    const u  = fi - i;
-    // Linear interpolation along control polygon (piecewise linear approximation)
-    out.push({
-      x: ctrlPts[i].x * (1-u) + ctrlPts[i+1].x * u,
-      y: ctrlPts[i].y * (1-u) + ctrlPts[i+1].y * u,
-    });
+  // For non-linear: use de Boor with auto-generated knots (fallback path)
+  return evalBSplineDeBoor(ctrlPts, null, 3,
+    Math.min(64, Math.max(16, ctrlPts.length * 3)));
+}
+
+// Cox-de Boor B-spline evaluation.
+// Works for CLAMPED open B-splines of any degree.
+// If knots is null/empty, generates a uniform clamped knot vector.
+function evalBSplineDeBoor(ctrl, knots, degree, numSamples) {
+  const n = ctrl.length;
+  const p = Math.min(degree || 3, n - 1);
+
+  // Build knot vector if not provided
+  if (!knots || knots.length < n + p + 1) {
+    knots = [];
+    for (let i = 0; i <= p; i++) knots.push(0);
+    const inner = n - p - 1;
+    for (let i = 1; i <= inner; i++) knots.push(i / (inner + 1));
+    for (let i = 0; i <= p; i++) knots.push(1);
+  }
+
+  const tMin = knots[p];
+  const tMax = knots[n];
+  const out  = [];
+
+  for (let s = 0; s <= numSamples; s++) {
+    // Parameter value — clamp slightly inside to avoid edge artifacts
+    let x = tMin + (tMax - tMin) * s / numSamples;
+    if (s === numSamples) x = tMax - 1e-9;
+
+    // Find knot span k: largest k such that knots[k] <= x < knots[k+1]
+    let k = p;
+    while (k < n - 1 && knots[k + 1] <= x) k++;
+
+    // De Boor's algorithm — copy the (p+1) relevant control points
+    const d = [];
+    for (let i = 0; i <= p; i++)
+      d.push({ x: ctrl[k - p + i].x, y: ctrl[k - p + i].y });
+
+    for (let r = 1; r <= p; r++) {
+      for (let j = p; j >= r; j--) {
+        const ki    = j + k - p;
+        const denom = knots[ki + p - r + 1] - knots[ki];
+        if (Math.abs(denom) < 1e-10) continue;
+        const alpha = (x - knots[ki]) / denom;
+        d[j].x = (1 - alpha) * d[j - 1].x + alpha * d[j].x;
+        d[j].y = (1 - alpha) * d[j - 1].y + alpha * d[j].y;
+      }
+    }
+    out.push({ x: d[p].x, y: d[p].y });
   }
   return out;
 }
@@ -392,12 +428,13 @@ function parseDXF(text, tol = 1.0) {
     // ── SPLINE ─────────────────────────────────────────────
     if (etype === 'SPLINE') {
       let layer='0', flags=0, degree=3;
-      const ctrlX=[],ctrlY=[],fitX=[],fitY=[];
+      const ctrlX=[],ctrlY=[],fitX=[],fitY=[],spKnots=[];
       while (gi<G.length&&G[gi][0]!==0) {
         const [c,v]=G[gi++];
         if(c===8)  layer=v;
         if(c===70) flags=+v;
         if(c===71) degree=+v;
+        if(c===40) spKnots.push(+v); // knot vector values
         if(c===10) ctrlX.push(+v);
         if(c===20) ctrlY.push(+v);
         if(c===11) fitX.push(+v);
@@ -405,7 +442,7 @@ function parseDXF(text, tol = 1.0) {
       }
       const spClosed   = (flags&1)!==0;
       const spPeriodic = (flags&2)!==0;
-      const spLinear   = (flags&16)!==0; // flag bit 4 = linear (line drawn as spline)
+      const spLinear   = (flags&16)!==0;
 
       let rawPts=[];
       if (fitX.length>=3 && fitX.length===fitY.length) {
@@ -413,29 +450,31 @@ function parseDXF(text, tol = 1.0) {
       } else if (ctrlX.length>=2 && ctrlX.length===ctrlY.length) {
         const ctrl = ctrlX.map((x,i)=>({x,y:ctrlY[i]}));
         if (spClosed || spPeriodic) {
-          // Closed/periodic → evaluate as periodic B-spline
+          // Closed/periodic → evaluate as uniform periodic B-spline
           if (ctrl.length >= 4) {
             const numPts = Math.min(128, Math.max(32, ctrl.length*2));
             rawPts = evalClosedBSpline3(ctrl, numPts);
           } else {
             rawPts = ctrl;
           }
+        } else if (spLinear) {
+          // Linear spline → just start and end (straight line segment)
+          rawPts = [ctrl[0], ctrl[ctrl.length-1]];
         } else {
-          // Open → approximate for chain-building
-          rawPts = evalOpenSplineApprox(ctrl, spLinear);
+          // Open curved B-spline → Cox-de Boor evaluation with actual knots
+          const numPts = Math.min(96, Math.max(16, ctrl.length*4));
+          rawPts = evalBSplineDeBoor(ctrl, spKnots.length ? spKnots : null, degree, numPts);
         }
       }
       if (rawPts.length < 2) continue;
 
       if (spClosed || spPeriodic) {
-        // Check geo-closed too
         const d0 = Math.hypot(rawPts[0].x-rawPts[rawPts.length-1].x,
                               rawPts[0].y-rawPts[rawPts.length-1].y);
         if (d0 < Math.max(tol*5, 0.5) && rawPts.length>3)
           rawPts = rawPts.slice(0,-1);
         addShape(rawPts, layer);
       } else {
-        // Open segment → goes into chain-builder
         addOpenSeg(rawPts, layer);
       }
       continue;
