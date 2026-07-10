@@ -553,13 +553,6 @@ function parseDXF(text, tol = 1.0) {
   return { shapes, foundTypes };
 }
 
-  const shapes = [];
-
-  while (gi < G.length) {
-    if (G[gi][0]===0 && G[gi][1]==='ENDSEC') break;
-    if (G[gi][0] !== 0) { gi++; continue; }
-    const etype = G[gi++][1];
-
 // ═══════════════════════════════════════════════════════════
 //  GUILLOTINE BSSF  +  ROTATION STEPS
 // ═══════════════════════════════════════════════════════════
