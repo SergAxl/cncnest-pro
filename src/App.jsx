@@ -76,24 +76,20 @@ function polygonArea(pts) {
   return Math.abs(a/2);
 }
 
-// Evaluate a CLOSED PERIODIC cubic B-spline at numPts uniform samples.
-// Uses the uniform cubic B-spline basis (Catmull-Rom variant).
-// Works for any number of control points n ≥ 4.
+// Evaluate closed periodic cubic B-spline
 function evalClosedBSpline3(ctrlPts, numPts) {
   const n = ctrlPts.length;
   const out = [];
   for (let s = 0; s < numPts; s++) {
-    const t  = s / numPts;        // parameter in [0, 1)
+    const t  = s / numPts;
     const fn = t * n;
     const k  = Math.floor(fn);
-    const u  = fn - k;            // local parameter in [0, 1)
-    const u2 = u * u, u3 = u2 * u;
-    // Uniform cubic B-spline basis functions
+    const u  = fn - k;
+    const u2 = u*u, u3 = u2*u;
     const b0 = (1 - 3*u + 3*u2 - u3) / 6;
-    const b1 = (4 - 6*u2 + 3*u3) / 6;
+    const b1 = (4 - 6*u2 + 3*u3)     / 6;
     const b2 = (1 + 3*u + 3*u2 - 3*u3) / 6;
     const b3 = u3 / 6;
-    // Wrap indices for periodic spline
     const p0 = ctrlPts[(k + n - 1) % n];
     const p1 = ctrlPts[ k          % n];
     const p2 = ctrlPts[(k + 1)     % n];
@@ -104,6 +100,79 @@ function evalClosedBSpline3(ctrlPts, numPts) {
     });
   }
   return out;
+}
+
+// Approximate an OPEN B-spline segment as a polyline.
+// For clamped B-splines: curve starts at P[0], ends at P[n-1].
+// flag=24 (linear): just two endpoints.
+function evalOpenSplineApprox(ctrlPts, isLinear) {
+  if (!ctrlPts.length) return [];
+  if (isLinear || ctrlPts.length <= 2)
+    return [ctrlPts[0], ctrlPts[ctrlPts.length-1]];
+  // Sample control polygon at higher density for curved segments
+  const n = ctrlPts.length;
+  const numPts = Math.min(64, Math.max(n, 8));
+  const out = [];
+  for (let s = 0; s <= numPts; s++) {
+    const t = s / numPts;
+    const fi = t * (n - 1);
+    const i  = Math.min(Math.floor(fi), n - 2);
+    const u  = fi - i;
+    // Linear interpolation along control polygon (piecewise linear approximation)
+    out.push({
+      x: ctrlPts[i].x * (1-u) + ctrlPts[i+1].x * u,
+      y: ctrlPts[i].y * (1-u) + ctrlPts[i+1].y * u,
+    });
+  }
+  return out;
+}
+
+// Connect open segments into closed chains (contours).
+// Each segment has {pts, startPt, endPt}. Matching tolerance: chainTol mm.
+function buildClosedChains(segs, chainTol = 0.2) {
+  if (!segs.length) return [];
+  const tolSq = chainTol * chainTol;
+  const distSq = (a, b) => (a.x-b.x)**2 + (a.y-b.y)**2;
+  const n = segs.length;
+  const used = new Set();
+  const chains = [];
+
+  for (let si = 0; si < n; si++) {
+    if (used.has(si)) continue;
+    const chain = [...segs[si].pts];
+    used.add(si);
+    const startPt = segs[si].startPt;
+    let curEnd    = segs[si].endPt;
+
+    // Extend chain greedily by matching endpoints
+    let extended = true;
+    while (extended) {
+      extended = false;
+      for (let j = 0; j < n; j++) {
+        if (used.has(j)) continue;
+        const seg = segs[j];
+        if (distSq(curEnd, seg.startPt) < tolSq) {
+          chain.push(...seg.pts.slice(1));
+          curEnd = seg.endPt;
+          used.add(j);
+          extended = true;
+          break;
+        }
+        if (distSq(curEnd, seg.endPt) < tolSq) {
+          chain.push(...[...seg.pts].reverse().slice(1));
+          curEnd = seg.startPt;
+          used.add(j);
+          extended = true;
+          break;
+        }
+      }
+    }
+
+    // Only keep chains that close back to the starting point
+    if (distSq(curEnd, startPt) < tolSq * 4 && chain.length >= 3)
+      chains.push(chain);
+  }
+  return chains;
 }
 
 // Decimate polygon if too many points (for rendering performance)
@@ -201,69 +270,83 @@ function bulgeArcPts(x1,y1,x2,y2,bulge,tol) {
 }
 
 function parseDXF(text, tol = 1.0) {
-  // Tokenise: lines come in code/value pairs
-  const lines = text.replace(/\r/g, '').split('\n')
-    .map(l => l.trim()).filter(Boolean);
+  const raw = text.replace(/\r/g,'').split('\n').map(l=>l.trim()).filter(Boolean);
   const G = [];
-  for (let i = 0; i+1 < lines.length; i += 2)
-    G.push([+lines[i], lines[i+1]]);
+  for (let i = 0; i+1 < raw.length; i += 2)
+    G.push([+raw[i], raw[i+1]]);
 
-  // Fast-forward to ENTITIES section
   let gi = 0;
   while (gi < G.length && !(G[gi][0]===2 && G[gi][1]==='ENTITIES')) gi++;
 
-  // Collect entity types for diagnostics
   const foundTypes = new Set();
   for (let k = gi; k < G.length; k++)
-    if (G[k][0] === 0 && G[k][1] !== 'ENDSEC' && G[k][1] !== 'EOF')
-      foundTypes.add(G[k][1]);
+    if (G[k][0]===0 && G[k][1]!=='ENDSEC' && G[k][1]!=='EOF') foundTypes.add(G[k][1]);
 
   gi++;
 
-  const shapes = [];
+  const shapes   = []; // closed contours
+  const openSegs = []; // open spline/polyline segments → chain-build later
+
+  // ── min-size helper (applied after Y-flip) ─────────────
+  const addShape = (pts, layer) => {
+    if (pts.length < 3) return;
+    const flipped = pts.map(({x,y}) => ({x, y:-y}));
+    const bb = getBBox(flipped);
+    // Skip truly tiny annotation symbols (< 1.5mm in both dims)
+    if (bb.w < 1.5 && bb.h < 1.5) return;
+    const poly = decimatePoly(flipped);
+    shapes.push({ polygon:poly, w:bb.w, h:bb.h, layer });
+  };
+
+  const addOpenSeg = (pts, layer) => {
+    if (pts.length < 2) return;
+    const flipped = pts.map(({x,y}) => ({x, y:-y}));
+    openSegs.push({
+      layer,
+      pts:      flipped,
+      startPt:  flipped[0],
+      endPt:    flipped[flipped.length-1],
+    });
+  };
 
   while (gi < G.length) {
     if (G[gi][0]===0 && G[gi][1]==='ENDSEC') break;
     if (G[gi][0] !== 0) { gi++; continue; }
     const etype = G[gi++][1];
 
-    // ── LWPOLYLINE ─────────────────────────────────────────
+    // ── LWPOLYLINE ────────────────────────────────────────
     if (etype === 'LWPOLYLINE') {
       let layer='0', flags=0;
       const xs=[], ys=[], bl=[];
       while (gi < G.length && G[gi][0] !== 0) {
         const [c,v] = G[gi++];
-        if (c===8)  layer = v;
-        if (c===70) flags = +v;
+        if (c===8)  layer=v;
+        if (c===70) flags=+v;
         if (c===10) { xs.push(+v); bl.push(0); }
         if (c===20) ys.push(+v);
-        if (c===42) bl[bl.length-1] = +v;
+        if (c===42) bl[bl.length-1]=+v;
       }
-      // Принимаем: флаг замкнутости ИЛИ геометрически замкнутая (первая ≈ последняя)
-      const geoClosed = xs.length >= 3 &&
-        Math.hypot(xs[0]-xs[xs.length-1], ys[0]-ys[ys.length-1]) < tol * 10;
-      const isClosed = (flags & 1) || geoClosed;
-      if (xs.length >= 3 && isClosed) {
-        const count = (geoClosed && !(flags & 1)) ? xs.length - 1 : xs.length;
+      const geoCl = xs.length>=3 &&
+        Math.hypot(xs[0]-xs[xs.length-1], ys[0]-ys[ys.length-1]) < tol*10;
+      const isClosed = (flags&1) || geoCl;
+      if (xs.length >= 2) {
+        const count = (geoCl && !(flags&1)) ? xs.length-1 : xs.length;
         const pts = [];
-        for (let j = 0; j < count; j++) {
-          pts.push({ x:xs[j], y:ys[j] });
+        for (let j=0; j<count; j++) {
+          pts.push({x:xs[j], y:ys[j]});
           if (Math.abs(bl[j]) > 1e-5) {
-            const nj = (j+1) % xs.length;
-            bulgeArcPts(xs[j],ys[j],xs[nj],ys[nj],bl[j],tol)
-              .slice(0,-1).forEach(p => pts.push(p));
+            const nj=(j+1)%xs.length;
+            bulgeArcPts(xs[j],ys[j],xs[nj],ys[nj],bl[j],tol).slice(0,-1)
+              .forEach(p=>pts.push(p));
           }
         }
-        if (pts.length >= 3) {
-          // Y-flip only — NO centering here (groupContours will normalize after hole grouping)
-          const n = pts.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
-          shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
-        }
+        if (isClosed) addShape(pts, layer);
+        else           addOpenSeg(pts, layer);
       }
       continue;
     }
 
-    // ── POLYLINE / VERTEX (формат R12) ─────────────────────
+    // ── POLYLINE / VERTEX ────────────────────────────────
     if (etype === 'POLYLINE') {
       let layer='0', flags=0;
       while (gi < G.length && G[gi][0] !== 0) {
@@ -271,155 +354,211 @@ function parseDXF(text, tol = 1.0) {
         if (c===8)  layer=v;
         if (c===70) flags=+v;
       }
-      const verts = [];
+      const verts=[];
       while (gi < G.length) {
-        if (G[gi][0] !== 0)          { gi++; continue; }
-        if (G[gi][1] === 'SEQEND')   { gi++; break; }
-        if (G[gi][1] !== 'VERTEX')   { break; }
+        if (G[gi][0]!==0)            { gi++; continue; }
+        if (G[gi][1]==='SEQEND')     { gi++; break; }
+        if (G[gi][1]!=='VERTEX')     { break; }
         gi++;
-        let vx=0, vy=0, vb=0, vf=0;
-        while (gi < G.length && G[gi][0] !== 0) {
-          const [c,v] = G[gi++];
-          if (c===10) vx=+v;
-          if (c===20) vy=+v;
-          if (c===42) vb=+v;
-          if (c===70) vf=+v;
+        let vx=0,vy=0,vb=0,vf=0;
+        while (gi<G.length&&G[gi][0]!==0) {
+          const [c,v]=G[gi++];
+          if(c===10)vx=+v; if(c===20)vy=+v;
+          if(c===42)vb=+v; if(c===70)vf=+v;
         }
-        if (!(vf & 16)) verts.push({ x:vx, y:vy, b:vb }); // пропуск mesh-вершин
+        if(!(vf&16)) verts.push({x:vx,y:vy,b:vb});
       }
-      const geoCl2 = verts.length >= 3 &&
+      const geoCl2 = verts.length>=3 &&
         Math.hypot(verts[0].x-verts[verts.length-1].x,
-                   verts[0].y-verts[verts.length-1].y) < tol * 10;
-      if (verts.length >= 3 && ((flags & 1) || geoCl2)) {
-        const count = (geoCl2 && !(flags & 1)) ? verts.length - 1 : verts.length;
-        const out = [];
-        for (let j = 0; j < count; j++) {
-          out.push({ x:verts[j].x, y:verts[j].y });
-          if (Math.abs(verts[j].b) > 1e-5) {
-            const nj = (j+1) % verts.length;
+                   verts[0].y-verts[verts.length-1].y) < tol*10;
+      const isCl2  = (flags&1)||geoCl2;
+      const count2 = (geoCl2&&!(flags&1)) ? verts.length-1 : verts.length;
+      if (verts.length >= 2) {
+        const out=[];
+        for(let j=0;j<count2;j++){
+          out.push({x:verts[j].x,y:verts[j].y});
+          if(Math.abs(verts[j].b)>1e-5){
+            const nj=(j+1)%verts.length;
             bulgeArcPts(verts[j].x,verts[j].y,verts[nj].x,verts[nj].y,verts[j].b,tol)
-              .slice(0,-1).forEach(p => out.push(p));
+              .slice(0,-1).forEach(p=>out.push(p));
           }
         }
-        if (out.length >= 3) {
-          const n = out.map(({x,y}) => ({x, y:-y})), bb = getBBox(n);
-          shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
-        }
+        if (isCl2) addShape(out, layer);
+        else        addOpenSeg(out, layer);
       }
       continue;
     }
 
     // ── SPLINE ─────────────────────────────────────────────
-    // Priority: fit points (code 11/21) → on-curve, use directly.
-    // Fallback:  periodic closed → evaluate as uniform cubic B-spline.
     if (etype === 'SPLINE') {
       let layer='0', flags=0, degree=3;
-      const ctrlX=[], ctrlY=[], fitX=[], fitY=[];
-      while (gi < G.length && G[gi][0] !== 0) {
-        const [c,v] = G[gi++];
-        if (c===8)  layer=v;
-        if (c===70) flags=+v;
-        if (c===71) degree=+v;
-        if (c===10) ctrlX.push(+v);
-        if (c===20) ctrlY.push(+v);
-        if (c===11) fitX.push(+v);
-        if (c===21) fitY.push(+v);
+      const ctrlX=[],ctrlY=[],fitX=[],fitY=[];
+      while (gi<G.length&&G[gi][0]!==0) {
+        const [c,v]=G[gi++];
+        if(c===8)  layer=v;
+        if(c===70) flags=+v;
+        if(c===71) degree=+v;
+        if(c===10) ctrlX.push(+v);
+        if(c===20) ctrlY.push(+v);
+        if(c===11) fitX.push(+v);
+        if(c===21) fitY.push(+v);
       }
-      const spClosed   = (flags & 1) !== 0;
-      const spPeriodic = (flags & 2) !== 0;
-      let rawPts = [];
-      if (fitX.length >= 3 && fitX.length === fitY.length) {
-        rawPts = fitX.map((x,i) => ({ x, y: fitY[i] }));
-      } else if (ctrlX.length >= 3 && ctrlX.length === ctrlY.length) {
-        const ctrl = ctrlX.map((x,i) => ({ x, y: ctrlY[i] }));
-        if (spPeriodic && ctrl.length >= 4) {
-          // Evaluate as uniform periodic cubic B-spline for smooth curve
-          const numPts = Math.min(128, Math.max(32, ctrl.length * 2));
-          rawPts = evalClosedBSpline3(ctrl, numPts);
+      const spClosed   = (flags&1)!==0;
+      const spPeriodic = (flags&2)!==0;
+      const spLinear   = (flags&16)!==0; // flag bit 4 = linear (line drawn as spline)
+
+      let rawPts=[];
+      if (fitX.length>=3 && fitX.length===fitY.length) {
+        rawPts = fitX.map((x,i)=>({x,y:fitY[i]}));
+      } else if (ctrlX.length>=2 && ctrlX.length===ctrlY.length) {
+        const ctrl = ctrlX.map((x,i)=>({x,y:ctrlY[i]}));
+        if (spClosed || spPeriodic) {
+          // Closed/periodic → evaluate as periodic B-spline
+          if (ctrl.length >= 4) {
+            const numPts = Math.min(128, Math.max(32, ctrl.length*2));
+            rawPts = evalClosedBSpline3(ctrl, numPts);
+          } else {
+            rawPts = ctrl;
+          }
         } else {
-          rawPts = ctrl;
+          // Open → approximate for chain-building
+          rawPts = evalOpenSplineApprox(ctrl, spLinear);
         }
       }
-      if (rawPts.length < 3) continue;
-      const d0 = Math.hypot(rawPts[0].x-rawPts[rawPts.length-1].x,
-                            rawPts[0].y-rawPts[rawPts.length-1].y);
-      const geoClSp = d0 < Math.max(tol*10, 1.0);
-      if (!spClosed && !spPeriodic && !geoClSp) continue;
-      if (geoClSp && rawPts.length > 3) rawPts = rawPts.slice(0,-1);
-      // Min size filter — skip annotation symbols & dimension marks
-      const tmpBB = getBBox(rawPts);
-      if (tmpBB.w < 5 || tmpBB.h < 5) continue;
-      if (polygonArea(rawPts) < 50) continue;
-      const n = decimatePoly(rawPts.map(({x,y}) => ({x, y:-y})));
-      const bb = getBBox(n);
-      shapes.push({ polygon:n, w:bb.w, h:bb.h, layer });
+      if (rawPts.length < 2) continue;
+
+      if (spClosed || spPeriodic) {
+        // Check geo-closed too
+        const d0 = Math.hypot(rawPts[0].x-rawPts[rawPts.length-1].x,
+                              rawPts[0].y-rawPts[rawPts.length-1].y);
+        if (d0 < Math.max(tol*5, 0.5) && rawPts.length>3)
+          rawPts = rawPts.slice(0,-1);
+        addShape(rawPts, layer);
+      } else {
+        // Open segment → goes into chain-builder
+        addOpenSeg(rawPts, layer);
+      }
       continue;
     }
 
-    // ── ARC (незамкнутый, пропуск — только для info) ───────
-    if (etype === 'ARC') {
-      while (gi < G.length && G[gi][0] !== 0) gi++;
-      continue;
-    }
-
-    // ── LINE (незамкнутый, пропуск) ────────────────────────
-    if (etype === 'LINE') {
-      while (gi < G.length && G[gi][0] !== 0) gi++;
-      continue;
-    }
-
-    // ── CIRCLE ─────────────────────────────────────────────
+    // ── CIRCLE ────────────────────────────────────────────
     if (etype === 'CIRCLE') {
-      let layer='0', cx=0, cy=0, r=0;
-      while (gi < G.length && G[gi][0] !== 0) {
-        const [c,v] = G[gi++];
-        if (c===8)  layer=v;
-        if (c===10) cx=+v; if (c===20) cy=+v; if (c===40) r=+v;
+      let layer='0',cx=0,cy=0,r=0;
+      while(gi<G.length&&G[gi][0]!==0){
+        const [c,v]=G[gi++];
+        if(c===8) layer=v;
+        if(c===10)cx=+v; if(c===20)cy=+v; if(c===40)r=+v;
       }
-      if (r > 0.001) {
-        const segs = Math.max(16, Math.ceil(2*Math.PI*r/tol));
-        const pts = Array.from({length:segs}, (_,i) => {
-          const a = 2*Math.PI*i/segs;
-          return { x: cx+r*Math.cos(a), y: -(cy+r*Math.sin(a)) }; // Y-flip inline
+      if(r>0.001){
+        const segs=Math.max(16,Math.ceil(2*Math.PI*r/tol));
+        const pts=Array.from({length:segs},(_,i)=>{
+          const a=2*Math.PI*i/segs;
+          return{x:cx+r*Math.cos(a),y:cy+r*Math.sin(a)};
         });
-        const bb=getBBox(pts);
-        shapes.push({ polygon:pts, w:bb.w, h:bb.h, layer });
+        addShape(pts, layer);
       }
       continue;
     }
 
-    // ── ELLIPSE ─────────────────────────────────────────────
+    // ── ELLIPSE ───────────────────────────────────────────
     if (etype === 'ELLIPSE') {
-      let layer='0', cx=0, cy=0, mX=1, mY=0, ratio=1, sp=0, ep=2*Math.PI;
-      while (gi < G.length && G[gi][0] !== 0) {
-        const [c,v] = G[gi++];
-        if (c===8)  layer=v;
-        if (c===10) cx=+v;  if (c===20) cy=+v;
-        if (c===11) mX=+v;  if (c===21) mY=+v;
-        if (c===40) ratio=+v;
-        if (c===41) sp=+v;  if (c===42) ep=+v;
+      let layer='0',cx=0,cy=0,mX=1,mY=0,ratio=1,sp=0,ep=2*Math.PI;
+      while(gi<G.length&&G[gi][0]!==0){
+        const [c,v]=G[gi++];
+        if(c===8) layer=v;
+        if(c===10)cx=+v; if(c===20)cy=+v;
+        if(c===11)mX=+v; if(c===21)mY=+v;
+        if(c===40)ratio=+v; if(c===41)sp=+v; if(c===42)ep=+v;
       }
-      const mR = Math.hypot(mX,mY), mnR = mR*ratio, ang = Math.atan2(mY,mX);
-      if (mR > 0.001) {
-        let sw = ep - sp; if (sw <= 0) sw += 2*Math.PI;
-        const segs = Math.max(16, Math.ceil(sw * Math.max(mR,mnR) / tol));
-        const pts = Array.from({length:segs}, (_,i) => {
-          const t = sp + sw*i/segs;
-          const lx=mR*Math.cos(t), ly=mnR*Math.sin(t);
-          return { x:  cx+lx*Math.cos(ang)-ly*Math.sin(ang),
-                   y: -(cy+lx*Math.sin(ang)+ly*Math.cos(ang)) }; // Y-flip inline
+      const mR=Math.hypot(mX,mY),mnR=mR*ratio,ang=Math.atan2(mY,mX);
+      if(mR>0.001){
+        let sw=ep-sp; if(sw<=0)sw+=2*Math.PI;
+        const segs=Math.max(16,Math.ceil(sw*Math.max(mR,mnR)/tol));
+        const pts=Array.from({length:segs},(_,i)=>{
+          const t=sp+sw*i/segs;
+          const lx=mR*Math.cos(t),ly=mnR*Math.sin(t);
+          return{x:cx+lx*Math.cos(ang)-ly*Math.sin(ang),
+                 y:cy+lx*Math.sin(ang)+ly*Math.cos(ang)};
         });
-        const bb=getBBox(pts);
-        shapes.push({ polygon:pts, w:bb.w, h:bb.h, layer });
+        if(sw>2*Math.PI*0.99) addShape(pts, layer);
+        else addOpenSeg(pts, layer);
       }
       continue;
     }
 
-    // Skip unknown entity body
-    while (gi < G.length && G[gi][0] !== 0) gi++;
+    // ── ARC (open) ─────────────────────────────────────────
+    if (etype === 'ARC') {
+      let layer='0',cx=0,cy=0,r=0,sa=0,ea=360;
+      while(gi<G.length&&G[gi][0]!==0){
+        const [c,v]=G[gi++];
+        if(c===8) layer=v;
+        if(c===10)cx=+v; if(c===20)cy=+v; if(c===40)r=+v;
+        if(c===50)sa=+v; if(c===51)ea=+v;
+      }
+      if(r>0.001){
+        let span=ea-sa; if(span<=0)span+=360;
+        if(span>359.9){
+          // Full circle
+          const segs=Math.max(16,Math.ceil(2*Math.PI*r/tol));
+          const pts=Array.from({length:segs},(_,i)=>{
+            const a=(sa+span*i/segs)*Math.PI/180;
+            return{x:cx+r*Math.cos(a),y:cy+r*Math.sin(a)};
+          });
+          addShape(pts, layer);
+        } else {
+          const segs=Math.max(4,Math.ceil(span*Math.PI/180*r/tol));
+          const pts=Array.from({length:segs+1},(_,i)=>{
+            const a=(sa+span*i/segs)*Math.PI/180;
+            return{x:cx+r*Math.cos(a),y:cy+r*Math.sin(a)};
+          });
+          addOpenSeg(pts, layer);
+        }
+      }
+      continue;
+    }
+
+    // ── LINE (as open segment) ──────────────────────────────
+    if (etype === 'LINE') {
+      let layer='0',x1=0,y1=0,x2=0,y2=0;
+      while(gi<G.length&&G[gi][0]!==0){
+        const [c,v]=G[gi++];
+        if(c===8) layer=v;
+        if(c===10)x1=+v; if(c===20)y1=+v;
+        if(c===11)x2=+v; if(c===21)y2=+v;
+      }
+      addOpenSeg([{x:x1,y:y1},{x:x2,y:y2}], layer);
+      continue;
+    }
+
+    // Skip any other entity body
+    while(gi<G.length&&G[gi][0]!==0) gi++;
   }
+
+  // ── Chain-build closed contours from open segments ───────
+  // Group by layer, then stitch connected segments
+  const segsByLayer = {};
+  for (const seg of openSegs) {
+    if (!segsByLayer[seg.layer]) segsByLayer[seg.layer] = [];
+    segsByLayer[seg.layer].push(seg);
+  }
+  for (const [layer, segs] of Object.entries(segsByLayer)) {
+    const chains = buildClosedChains(segs, 0.5); // 0.5mm connection tolerance
+    for (const chain of chains) {
+      const bb = getBBox(chain);
+      if (bb.w < 1 && bb.h < 1) continue; // skip dot-sized
+      shapes.push({ polygon: decimatePoly(chain), w:bb.w, h:bb.h, layer });
+    }
+  }
+
   return { shapes, foundTypes };
 }
+
+  const shapes = [];
+
+  while (gi < G.length) {
+    if (G[gi][0]===0 && G[gi][1]==='ENDSEC') break;
+    if (G[gi][0] !== 0) { gi++; continue; }
+    const etype = G[gi++][1];
 
 // ═══════════════════════════════════════════════════════════
 //  GUILLOTINE BSSF  +  ROTATION STEPS
@@ -1428,7 +1567,18 @@ export default function App() {
                 {isDraggingOver ? "⬇ Отпустите DXF файлы…" : "↑ или перетащите .dxf сюда"}
               </div>
 
-              <span style={CAP}>◈ ДЕТАЛИ [{parts.length}]</span>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+                <span style={CAP}>◈ ДЕТАЛИ [{parts.length}]</span>
+                {parts.length > 0 && (
+                  <button onClick={()=>{ if(window.confirm('Очистить весь список деталей?')) { setParts([]); setRes(null); setDirty(false); cancelEdit(); }}}
+                    style={{background:"none",border:"1px solid #ef444433",
+                      color:"#ef444488",borderRadius:2,padding:"1px 7px",
+                      cursor:"pointer",fontSize:9,
+                      fontFamily:"'JetBrains Mono',monospace"}}>
+                    ✕ ОЧИСТИТЬ
+                  </button>
+                )}
+              </div>
 
               {parts.length===0 && (
                 <div style={{color:"#0d2545",textAlign:"center",marginTop:16,fontSize:11}}>
