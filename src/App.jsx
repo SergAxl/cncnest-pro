@@ -328,8 +328,8 @@ function parseDXF(text, tol = 1.0) {
     if (pts.length < 3) return;
     const flipped = pts.map(({x,y}) => ({x, y:-y}));
     const bb = getBBox(flipped);
-    // Skip truly tiny annotation symbols (< 1.5mm in both dims)
-    if (bb.w < 1.5 && bb.h < 1.5) return;
+    if (bb.w < 1.5 && bb.h < 1.5) return;       // both tiny → skip
+    if (polygonArea(flipped) < 2) return;         // degenerate (self-intersecting) → skip
     const poly = decimatePoly(flipped);
     shapes.push({ polygon:poly, w:bb.w, h:bb.h, layer });
   };
@@ -574,17 +574,20 @@ function parseDXF(text, tol = 1.0) {
   }
 
   // ── Chain-build closed contours from open segments ───────
-  // Group by layer, then stitch connected segments
   const segsByLayer = {};
   for (const seg of openSegs) {
     if (!segsByLayer[seg.layer]) segsByLayer[seg.layer] = [];
     segsByLayer[seg.layer].push(seg);
   }
   for (const [layer, segs] of Object.entries(segsByLayer)) {
-    const chains = buildClosedChains(segs, 0.5); // 0.5mm connection tolerance
+    const chains = buildClosedChains(segs, 0.5);
     for (const chain of chains) {
-      const bb = getBBox(chain);
-      if (bb.w < 1 && bb.h < 1) continue; // skip dot-sized
+      const bb   = getBBox(chain);
+      const area = polygonArea(chain);
+      const minD = Math.min(bb.w, bb.h);
+      // Skip annotation marks, dimension arrows, degenerate micro-chains.
+      // Real cut parts always have area ≥ 200mm² and shortest side ≥ 5mm.
+      if (area < 200 || minD < 5) continue;
       shapes.push({ polygon: decimatePoly(chain), w:bb.w, h:bb.h, layer });
     }
   }
