@@ -220,11 +220,16 @@ function decimatePoly(pts, maxPts = 200) {
 
 // Group contours: inner polygons (holes) are nested inside their parent.
 // Groups by LAYER first to limit O(n²) scope.
+// Rules:
+//   • chainBuilt shapes (assembled from open segments) are always OUTER contours.
+//   • Only non-chainBuilt shapes (directly closed circles, polylines, splines)
+//     can become holes — and only if their bbox is FULLY inside the outer's bbox.
+//   • Each hole is assigned to the SMALLEST outer that contains it (immediate parent).
 // Returns array of {polygon, holes, w, h, layer}
 function groupContours(shapes) {
   if (!shapes.length) return [];
 
-  // Step 1: group by layer
+  // Group by layer
   const byLayer = {};
   for (const s of shapes) {
     const l = s.layer || '0';
@@ -235,34 +240,52 @@ function groupContours(shapes) {
   const result = [];
 
   for (const layer of Object.keys(byLayer)) {
-    // Sort largest → smallest (outer contours come first)
-    const group = byLayer[layer].sort((a,b) => b.area - a.area);
-    // Cap per-layer shapes to avoid O(n²) hang
+    const group  = byLayer[layer].sort((a,b) => b.area - a.area);
     const capped = group.length > 200 ? group.slice(0, 200) : group;
+    const n      = capped.length;
 
-    const used = new Set();
+    // Pre-compute bboxes
+    const bbs = capped.map(s => getBBox(s.polygon));
 
-    for (let i = 0; i < capped.length; i++) {
-      if (used.has(i)) continue;
-      const outer = capped[i];
-      const obb   = getBBox(outer.polygon);
-      const holes = [];
+    // For each non-chainBuilt shape, find the smallest outer that fully contains it
+    const holeOf = new Array(n).fill(-1); // index of parent outer
 
-      for (let j = i + 1; j < capped.length; j++) {
-        if (used.has(j)) continue;
-        const inner = capped[j];
-        // Quick bbox pre-filter (fast reject)
-        const ibb = getBBox(inner.polygon);
-        if (ibb.x0 < obb.x0-1 || ibb.y0 < obb.y0-1 ||
-            ibb.x1 > obb.x1+1 || ibb.y1 > obb.y1+1) continue;
-        // Centroid containment test
-        const cx = (ibb.x0+ibb.x1)/2, cy = (ibb.y0+ibb.y1)/2;
-        if (pointInPolygon(cx, cy, outer.polygon)) {
-          holes.push(inner.polygon);
-          used.add(j);
+    for (let j = 0; j < n; j++) {
+      if (capped[j].chainBuilt !== false) continue; // only non-chainBuilt can be holes
+      const ibb = bbs[j];
+      const hcx = (ibb.x0+ibb.x1)/2, hcy = (ibb.y0+ibb.y1)/2;
+      let bestIdx = -1, bestArea = Infinity;
+
+      for (let i = 0; i < n; i++) {
+        if (i === j) continue;
+        // chainBuilt:false shapes can also be outers for LWPOLYLINE-only DXF files
+        const obb = bbs[i];
+        // Hole bbox must be FULLY inside outer bbox (prevents adjacent-part confusion)
+        if (ibb.x0 < obb.x0 || ibb.y0 < obb.y0 ||
+            ibb.x1 > obb.x1 || ibb.y1 > obb.y1) continue;
+        // Centroid must be inside outer polygon
+        if (!pointInPolygon(hcx, hcy, capped[i].polygon)) continue;
+        // Pick the smallest outer (immediate parent)
+        if (capped[i].area < bestArea) {
+          bestArea = capped[i].area;
+          bestIdx  = i;
         }
       }
-      used.add(i);
+      if (bestIdx >= 0) holeOf[j] = bestIdx;
+    }
+
+    // Build result — each shape that is NOT a hole of anything becomes an outer part
+    for (let i = 0; i < n; i++) {
+      if (holeOf[i] >= 0) continue; // this shape is a hole, skip as outer
+
+      const outer = capped[i];
+      const obb   = bbs[i];
+
+      // Collect holes assigned to this outer
+      const holes = [];
+      for (let j = 0; j < n; j++) {
+        if (holeOf[j] === i) holes.push(capped[j].polygon);
+      }
 
       // Normalize: shift outer+holes by outer's bbox center
       const ocx  = (obb.x0+obb.x1)/2, ocy = (obb.y0+obb.y1)/2;
@@ -328,10 +351,12 @@ function parseDXF(text, tol = 1.0) {
     if (pts.length < 3) return;
     const flipped = pts.map(({x,y}) => ({x, y:-y}));
     const bb = getBBox(flipped);
-    if (bb.w < 1.5 && bb.h < 1.5) return;       // both tiny → skip
-    if (polygonArea(flipped) < 2) return;         // degenerate (self-intersecting) → skip
+    if (bb.w < 1.5 && bb.h < 1.5) return;
+    if (polygonArea(flipped) < 2) return;
     const poly = decimatePoly(flipped);
-    shapes.push({ polygon:poly, w:bb.w, h:bb.h, layer });
+    // chainBuilt:false → this is a directly-closed entity (circle, closed spline, etc.)
+    // — eligible to become a hole of a chain-built outer contour
+    shapes.push({ polygon:poly, w:bb.w, h:bb.h, layer, chainBuilt:false });
   };
 
   const addOpenSeg = (pts, layer) => {
@@ -588,7 +613,9 @@ function parseDXF(text, tol = 1.0) {
       // Skip annotation marks, dimension arrows, degenerate micro-chains.
       // Real cut parts always have area ≥ 200mm² and shortest side ≥ 5mm.
       if (area < 200 || minD < 5) continue;
-      shapes.push({ polygon: decimatePoly(chain), w:bb.w, h:bb.h, layer });
+      // chainBuilt:true → assembled from open segments, always an OUTER contour
+      // — never assigned as a hole of another shape
+      shapes.push({ polygon: decimatePoly(chain), w:bb.w, h:bb.h, layer, chainBuilt:true });
     }
   }
 
@@ -707,28 +734,27 @@ function SheetSVG({ data, W, H, sc, labels }) {
 
       {data?.pl.map(p => {
         const bx=p.x*sc, by=p.y*sc, bw=p.pw*sc, bh=p.ph*sc;
-        const col = PAL[p.ci];
-        const fz = Math.max(6, Math.min(10, bw/(p.name.length*0.72+1.5), bh/3.8));
-        const hasTxt = labels && bw > 28 && bh > 16;
-        const hasDim = labels && bw > 56 && bh > 32;
-        const ra = Math.round(p.rot||0);
-        const rLbl = ra > 0 ? ` ${ra}°` : '';
+        const col    = PAL[p.ci];
+        const fz     = Math.max(6, Math.min(12, bw/4.5, bh/3.2));
+        const hasTxt = labels && bw > 24 && bh > 14;
+        const hasDim = labels && bw > 52 && bh > 28;
 
         if (p.polyPts) {
-          // Build compound SVG path: outer contour + holes → fill-rule evenodd
           const ptToStr = (pt, i) =>
             `${i===0?'M':'L'}${((p.x+pt.x)*sc).toFixed(2)},${((p.y+pt.y)*sc).toFixed(2)}`;
           const outerD  = p.polyPts.map(ptToStr).join(' ') + ' Z';
           const holesD  = (p.holePts||[]).map(hole =>
             hole.map(ptToStr).join(' ') + ' Z'
           ).join(' ');
+          // Instance label: extract the 0-based index from iid ("partId_index")
+          const instNum = +(p.iid?.split('_').pop()||0) + 1;
+          const holeCount = (p.holePts||[]).length;
           return (
             <g key={p.iid}>
               <path d={outerD + ' ' + holesD}
                 fillRule="evenodd"
                 fill={col} fillOpacity={0.18}
                 stroke={col} strokeWidth={1.4}/>
-              {/* Holes: highlight inner contours */}
               {(p.holePts||[]).map((hole, hi) => (
                 <path key={hi}
                   d={hole.map(ptToStr).join(' ') + ' Z'}
@@ -745,9 +771,9 @@ function SheetSVG({ data, W, H, sc, labels }) {
                   fill={col} fontSize={fz}
                   fontFamily="'JetBrains Mono','Courier New',monospace"
                   fontWeight={700} fillOpacity={0.9}>
-                  {p.name}{rLbl}
-                  {(p.holePts||[]).length>0 &&
-                    <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{(p.holePts||[]).length}</tspan>}
+                  {instNum}
+                  {holeCount > 0 &&
+                    <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{holeCount}</tspan>}
                 </text>
               )}
             </g>
@@ -755,6 +781,9 @@ function SheetSVG({ data, W, H, sc, labels }) {
         }
 
         // ── Rectangle part ──────────────────────────────
+        const instNum = +(p.iid?.split('_').pop()||0) + 1;
+        const ra = Math.round(p.rot||0);
+        const holeCount = (p.holePts||[]).length;
         return (
           <g key={p.iid}>
             <rect x={bx+1} y={by+1}
@@ -771,7 +800,9 @@ function SheetSVG({ data, W, H, sc, labels }) {
                 fill={col} fontSize={fz}
                 fontFamily="'JetBrains Mono','Courier New',monospace"
                 fontWeight={700} fillOpacity={0.9}>
-                {ra===90||ra===270 ? `↺ ` : ra>0 ? `${ra}° ` : ''}{p.name}
+                {ra > 0 ? `↺ ` : ''}{instNum}
+                {holeCount > 0 &&
+                  <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{holeCount}</tspan>}
               </text>
             )}
             {hasDim && (
@@ -1875,7 +1906,7 @@ export default function App() {
             </div>
           )}
 
-          {/* Canvas viewport — zoom with wheel, pan with drag */}
+          {/* Canvas viewport — zoom with wheel, pan with drag, accept DXF drop */}
           <div ref={canvasRef}
             style={{flex:1, overflow:"hidden", background:"#020a14",
               cursor:"grab", position:"relative", userSelect:"none"}}
@@ -1883,7 +1914,10 @@ export default function App() {
             onMouseDown={onCanvasMouseDown}
             onMouseMove={onCanvasMouseMove}
             onMouseUp={onCanvasMouseUp}
-            onMouseLeave={onCanvasMouseUp}>
+            onMouseLeave={onCanvasMouseUp}
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}>
 
             {/* ── BUSY overlay ── */}
             {busy && (
