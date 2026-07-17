@@ -33,6 +33,30 @@ const DEMO = [
 ];
 
 // ═══════════════════════════════════════════════════════════
+//  THEME TOKENS
+// ═══════════════════════════════════════════════════════════
+const THEMES = {
+  dark: {
+    pageBg:"#030c18", panelBg:"#050e1c", panelBg2:"#040a15",
+    canvasBg:"#020a14", sheetBg:"#030c18", dotColor:"#0b2040",
+    border:"#0d2545", borderBright:"#1a3a5c",
+    textPrimary:"#d4eeff", textSecondary:"#7fa8cc", textTertiary:"#4a8ab5",
+    textMuted:"#1a3a5c", textDim:"#0a1e35",
+    accent:"#00e5ff", accentDim:"#1e6fa8", inputBg:"#030c18",
+    dimOverlay:"#020a1aee", rowAlt:"#05142a",
+  },
+  light: {
+    pageBg:"#eef2f7", panelBg:"#ffffff", panelBg2:"#f6f8fb",
+    canvasBg:"#dfe6ee", sheetBg:"#ffffff", dotColor:"#ccd6e2",
+    border:"#dbe3ec", borderBright:"#aebcce",
+    textPrimary:"#132840", textSecondary:"#3c5876", textTertiary:"#1f6690",
+    textMuted:"#93a6ba", textDim:"#c3d0dd",
+    accent:"#0891b2", accentDim:"#0891b2", inputBg:"#ffffff",
+    dimOverlay:"#eef2f7ee", rowAlt:"#e8f2f6",
+  },
+};
+
+// ═══════════════════════════════════════════════════════════
 //  GEOMETRY HELPERS
 // ═══════════════════════════════════════════════════════════
 function getBBox(pts) {
@@ -103,25 +127,19 @@ function evalClosedBSpline3(ctrlPts, numPts) {
 }
 
 // Approximate an OPEN B-spline segment as a polyline.
-// For clamped B-splines: curve starts at P[0], ends at P[n-1].
-// flag=24 (linear): just two endpoints.
 function evalOpenSplineApprox(ctrlPts, isLinear) {
   if (!ctrlPts.length) return [];
   if (isLinear || ctrlPts.length <= 2)
     return [ctrlPts[0], ctrlPts[ctrlPts.length-1]];
-  // For non-linear: use de Boor with auto-generated knots (fallback path)
   return evalBSplineDeBoor(ctrlPts, null, 3,
     Math.min(64, Math.max(16, ctrlPts.length * 3)));
 }
 
 // Cox-de Boor B-spline evaluation.
-// Works for CLAMPED open B-splines of any degree.
-// If knots is null/empty, generates a uniform clamped knot vector.
 function evalBSplineDeBoor(ctrl, knots, degree, numSamples) {
   const n = ctrl.length;
   const p = Math.min(degree || 3, n - 1);
 
-  // Build knot vector if not provided
   if (!knots || knots.length < n + p + 1) {
     knots = [];
     for (let i = 0; i <= p; i++) knots.push(0);
@@ -135,15 +153,12 @@ function evalBSplineDeBoor(ctrl, knots, degree, numSamples) {
   const out  = [];
 
   for (let s = 0; s <= numSamples; s++) {
-    // Parameter value — clamp slightly inside to avoid edge artifacts
     let x = tMin + (tMax - tMin) * s / numSamples;
     if (s === numSamples) x = tMax - 1e-9;
 
-    // Find knot span k: largest k such that knots[k] <= x < knots[k+1]
     let k = p;
     while (k < n - 1 && knots[k + 1] <= x) k++;
 
-    // De Boor's algorithm — copy the (p+1) relevant control points
     const d = [];
     for (let i = 0; i <= p; i++)
       d.push({ x: ctrl[k - p + i].x, y: ctrl[k - p + i].y });
@@ -164,7 +179,6 @@ function evalBSplineDeBoor(ctrl, knots, degree, numSamples) {
 }
 
 // Connect open segments into closed chains (contours).
-// Each segment has {pts, startPt, endPt}. Matching tolerance: chainTol mm.
 function buildClosedChains(segs, chainTol = 0.2) {
   if (!segs.length) return [];
   const tolSq = chainTol * chainTol;
@@ -180,7 +194,6 @@ function buildClosedChains(segs, chainTol = 0.2) {
     const startPt = segs[si].startPt;
     let curEnd    = segs[si].endPt;
 
-    // Extend chain greedily by matching endpoints
     let extended = true;
     while (extended) {
       extended = false;
@@ -204,14 +217,13 @@ function buildClosedChains(segs, chainTol = 0.2) {
       }
     }
 
-    // Only keep chains that close back to the starting point
     if (distSq(curEnd, startPt) < tolSq * 4 && chain.length >= 3)
       chains.push(chain);
   }
   return chains;
 }
 
-// Decimate polygon if too many points (for rendering performance)
+// Decimate polygon if too many points
 function decimatePoly(pts, maxPts = 200) {
   if (pts.length <= maxPts) return pts;
   const step = Math.ceil(pts.length / maxPts);
@@ -219,17 +231,9 @@ function decimatePoly(pts, maxPts = 200) {
 }
 
 // Group contours: inner polygons (holes) are nested inside their parent.
-// Groups by LAYER first to limit O(n²) scope.
-// Rules:
-//   • chainBuilt shapes (assembled from open segments) are always OUTER contours.
-//   • Only non-chainBuilt shapes (directly closed circles, polylines, splines)
-//     can become holes — and only if their bbox is FULLY inside the outer's bbox.
-//   • Each hole is assigned to the SMALLEST outer that contains it (immediate parent).
-// Returns array of {polygon, holes, w, h, layer}
 function groupContours(shapes) {
   if (!shapes.length) return [];
 
-  // Group by layer
   const byLayer = {};
   for (const s of shapes) {
     const l = s.layer || '0';
@@ -244,28 +248,21 @@ function groupContours(shapes) {
     const capped = group.length > 200 ? group.slice(0, 200) : group;
     const n      = capped.length;
 
-    // Pre-compute bboxes
     const bbs = capped.map(s => getBBox(s.polygon));
-
-    // For each non-chainBuilt shape, find the smallest outer that fully contains it
-    const holeOf = new Array(n).fill(-1); // index of parent outer
+    const holeOf = new Array(n).fill(-1);
 
     for (let j = 0; j < n; j++) {
-      if (capped[j].chainBuilt !== false) continue; // only non-chainBuilt can be holes
+      if (capped[j].chainBuilt !== false) continue;
       const ibb = bbs[j];
       const hcx = (ibb.x0+ibb.x1)/2, hcy = (ibb.y0+ibb.y1)/2;
       let bestIdx = -1, bestArea = Infinity;
 
       for (let i = 0; i < n; i++) {
         if (i === j) continue;
-        // chainBuilt:false shapes can also be outers for LWPOLYLINE-only DXF files
         const obb = bbs[i];
-        // Hole bbox must be FULLY inside outer bbox (prevents adjacent-part confusion)
         if (ibb.x0 < obb.x0 || ibb.y0 < obb.y0 ||
             ibb.x1 > obb.x1 || ibb.y1 > obb.y1) continue;
-        // Centroid must be inside outer polygon
         if (!pointInPolygon(hcx, hcy, capped[i].polygon)) continue;
-        // Pick the smallest outer (immediate parent)
         if (capped[i].area < bestArea) {
           bestArea = capped[i].area;
           bestIdx  = i;
@@ -274,20 +271,17 @@ function groupContours(shapes) {
       if (bestIdx >= 0) holeOf[j] = bestIdx;
     }
 
-    // Build result — each shape that is NOT a hole of anything becomes an outer part
     for (let i = 0; i < n; i++) {
-      if (holeOf[i] >= 0) continue; // this shape is a hole, skip as outer
+      if (holeOf[i] >= 0) continue;
 
       const outer = capped[i];
       const obb   = bbs[i];
 
-      // Collect holes assigned to this outer
       const holes = [];
       for (let j = 0; j < n; j++) {
         if (holeOf[j] === i) holes.push(capped[j].polygon);
       }
 
-      // Normalize: shift outer+holes by outer's bbox center
       const ocx  = (obb.x0+obb.x1)/2, ocy = (obb.y0+obb.y1)/2;
       const shft = ({x,y}) => ({x:x-ocx, y:y-ocy});
       const nPoly  = outer.polygon.map(shft);
@@ -300,10 +294,9 @@ function groupContours(shapes) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  DXF PARSER  (LWPOLYLINE · CIRCLE · ELLIPSE)
+//  DXF PARSER  (LWPOLYLINE · POLYLINE · SPLINE · CIRCLE · ELLIPSE · ARC · LINE)
 // ═══════════════════════════════════════════════════════════
 
-// Tessellate a DXF bulge arc from P1→P2 into polyline segments
 function bulgeArcPts(x1,y1,x2,y2,bulge,tol) {
   const ab = Math.abs(bulge);
   if (ab < 1e-5) return [];
@@ -313,7 +306,6 @@ function bulgeArcPts(x1,y1,x2,y2,bulge,tol) {
   const R = d / (2 * Math.sin(theta / 2));
   const hh = Math.sqrt(Math.max(0, R*R - (d/2)*(d/2)));
   const mx = (x1+x2)/2, my = (y1+y2)/2;
-  // Left-normal of chord
   const px = -(y2-y1)/d, py = (x2-x1)/d;
   const sgn = bulge > 0 ? 1 : -1;
   const cx = mx + sgn*hh*px, cy = my + sgn*hh*py;
@@ -325,7 +317,7 @@ function bulgeArcPts(x1,y1,x2,y2,bulge,tol) {
   return Array.from({ length: segs }, (_, i) => {
     const a = sa + (ea-sa) * (i+1) / segs;
     return { x: cx + R*Math.cos(a), y: cy + R*Math.sin(a) };
-  }); // last point == (x2,y2)
+  });
 }
 
 function parseDXF(text, tol = 1.0) {
@@ -343,10 +335,9 @@ function parseDXF(text, tol = 1.0) {
 
   gi++;
 
-  const shapes   = []; // closed contours
-  const openSegs = []; // open spline/polyline segments → chain-build later
+  const shapes   = [];
+  const openSegs = [];
 
-  // ── min-size helper (applied after Y-flip) ─────────────
   const addShape = (pts, layer) => {
     if (pts.length < 3) return;
     const flipped = pts.map(({x,y}) => ({x, y:-y}));
@@ -354,8 +345,6 @@ function parseDXF(text, tol = 1.0) {
     if (bb.w < 1.5 && bb.h < 1.5) return;
     if (polygonArea(flipped) < 2) return;
     const poly = decimatePoly(flipped);
-    // chainBuilt:false → this is a directly-closed entity (circle, closed spline, etc.)
-    // — eligible to become a hole of a chain-built outer contour
     shapes.push({ polygon:poly, w:bb.w, h:bb.h, layer, chainBuilt:false });
   };
 
@@ -459,7 +448,7 @@ function parseDXF(text, tol = 1.0) {
         if(c===8)  layer=v;
         if(c===70) flags=+v;
         if(c===71) degree=+v;
-        if(c===40) spKnots.push(+v); // knot vector values
+        if(c===40) spKnots.push(+v);
         if(c===10) ctrlX.push(+v);
         if(c===20) ctrlY.push(+v);
         if(c===11) fitX.push(+v);
@@ -475,7 +464,6 @@ function parseDXF(text, tol = 1.0) {
       } else if (ctrlX.length>=2 && ctrlX.length===ctrlY.length) {
         const ctrl = ctrlX.map((x,i)=>({x,y:ctrlY[i]}));
         if (spClosed || spPeriodic) {
-          // Closed/periodic → evaluate as uniform periodic B-spline
           if (ctrl.length >= 4) {
             const numPts = Math.min(128, Math.max(32, ctrl.length*2));
             rawPts = evalClosedBSpline3(ctrl, numPts);
@@ -483,10 +471,8 @@ function parseDXF(text, tol = 1.0) {
             rawPts = ctrl;
           }
         } else if (spLinear) {
-          // Linear spline → just start and end (straight line segment)
           rawPts = [ctrl[0], ctrl[ctrl.length-1]];
         } else {
-          // Open curved B-spline → Cox-de Boor evaluation with actual knots
           const numPts = Math.min(96, Math.max(16, ctrl.length*4));
           rawPts = evalBSplineDeBoor(ctrl, spKnots.length ? spKnots : null, degree, numPts);
         }
@@ -562,7 +548,6 @@ function parseDXF(text, tol = 1.0) {
       if(r>0.001){
         let span=ea-sa; if(span<=0)span+=360;
         if(span>359.9){
-          // Full circle
           const segs=Math.max(16,Math.ceil(2*Math.PI*r/tol));
           const pts=Array.from({length:segs},(_,i)=>{
             const a=(sa+span*i/segs)*Math.PI/180;
@@ -594,7 +579,6 @@ function parseDXF(text, tol = 1.0) {
       continue;
     }
 
-    // Skip any other entity body
     while(gi<G.length&&G[gi][0]!==0) gi++;
   }
 
@@ -610,11 +594,7 @@ function parseDXF(text, tol = 1.0) {
       const bb   = getBBox(chain);
       const area = polygonArea(chain);
       const minD = Math.min(bb.w, bb.h);
-      // Skip annotation marks, dimension arrows, degenerate micro-chains.
-      // Real cut parts always have area ≥ 200mm² and shortest side ≥ 5mm.
       if (area < 200 || minD < 5) continue;
-      // chainBuilt:true → assembled from open segments, always an OUTER contour
-      // — never assigned as a hole of another shape
       shapes.push({ polygon: decimatePoly(chain), w:bb.w, h:bb.h, layer, chainBuilt:true });
     }
   }
@@ -623,30 +603,65 @@ function parseDXF(text, tol = 1.0) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  GUILLOTINE BSSF  +  ROTATION STEPS
+//  POLYGON COLLISION  (NFP-lite — real edge intersection test)
 // ═══════════════════════════════════════════════════════════
+function cross2(o, a, b) {
+  return (a.x-o.x)*(b.y-o.y) - (a.y-o.y)*(b.x-o.x);
+}
 
+function segIntersect(p1,p2,p3,p4) {
+  const d1 = cross2(p3,p4,p1);
+  const d2 = cross2(p3,p4,p2);
+  const d3 = cross2(p1,p2,p3);
+  const d4 = cross2(p1,p2,p4);
+  if (((d1>1e-9&&d2<-1e-9)||(d1<-1e-9&&d2>1e-9)) &&
+      ((d3>1e-9&&d4<-1e-9)||(d3<-1e-9&&d4>1e-9))) return true;
+  return false;
+}
+
+// A, B: absolute-coordinate point arrays. True if the two polygons overlap.
+function polysOverlap(A, B) {
+  const bA=getBBox(A), bB=getBBox(B);
+  if (bA.x1<=bB.x0 || bB.x1<=bA.x0 || bA.y1<=bB.y0 || bB.y1<=bA.y0) return false;
+  const na=A.length, nb=B.length;
+  for (let i=0;i<na;i++) {
+    const a1=A[i], a2=A[(i+1)%na];
+    for (let j=0;j<nb;j++) {
+      const b1=B[j], b2=B[(j+1)%nb];
+      if (segIntersect(a1,a2,b1,b2)) return true;
+    }
+  }
+  if (pointInPolygon(A[0].x,A[0].y,B)) return true;
+  if (pointInPolygon(B[0].x,B[0].y,A)) return true;
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ORIENTATION BUILDER  (rotation candidates + collision polygon)
+// ═══════════════════════════════════════════════════════════
 function buildOrients(angles, part, gap) {
   const seen = new Set(), result = [];
   for (const angle of angles) {
-    let pw, ph, polyPts = null, holePts = null;
+    let pw, ph, polyPts = null, holePts = null, collisionPts;
     if (part.polygon) {
       const rotated = rotPts(part.polygon, angle);
       const bb = getBBox(rotated);
       pw = bb.w; ph = bb.h;
       polyPts = rotated.map(pt => ({ x:pt.x-bb.x0, y:pt.y-bb.y0 }));
-      // Rotate holes with the same angle, offset by the same bbox origin
       holePts = (part.holes||[]).map(hole =>
         rotPts(hole, angle).map(pt => ({ x:pt.x-bb.x0, y:pt.y-bb.y0 }))
       );
+      // Simplified copy specifically for collision testing (perf)
+      collisionPts = decimatePoly(polyPts, 50);
     } else {
       const a = ((angle % 180) + 180) % 180;
       [pw, ph] = (a < 45 || a >= 135) ? [part.w, part.h] : [part.h, part.w];
+      collisionPts = [{x:0,y:0},{x:pw,y:0},{x:pw,y:ph},{x:0,y:ph}];
     }
     const key = `${Math.round(pw*10)}_${Math.round(ph*10)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push({ pw, ph, bw:pw+gap, bh:ph+gap, rot:angle, polyPts, holePts });
+    result.push({ pw, ph, bw:pw+gap, bh:ph+gap, rot:angle, polyPts, holePts, collisionPts });
   }
   return result;
 }
@@ -654,90 +669,121 @@ function buildOrients(angles, part, gap) {
 function getOrients(part, gap, rotSteps) {
   if (!part.rot)     return buildOrients([0], part, gap);
   if (!part.polygon) return buildOrients([0, 90], part, gap);
-  // Polygon → try all rotSteps discrete angles
   return buildOrients(
     Array.from({ length:rotSteps }, (_, i) => i*360/rotSteps),
     part, gap
   );
 }
 
-function placeItem(item, sheet, W, H, gap, rotSteps) {
-  const ors = getOrients(item, gap, rotSteps);
-  let best = null, bScore = Infinity;
-  for (const o of ors)
-    for (const r of sheet.fr)
-      if (o.bw <= r.w+0.001 && o.bh <= r.h+0.001) {
-        const s = Math.min(r.w-o.bw, r.h-o.bh);
-        if (s < bScore) { bScore=s; best={r,o}; }
-      }
-  if (!best) return false;
-  const { r, o } = best;
-  sheet.pl.push({
-    iid:item.iid, pid:item.id, name:item.name,
-    x:r.x, y:r.y, pw:o.pw, ph:o.ph, rot:o.rot, ci:item.ci,
-    polyPts:o.polyPts, holePts:o.holePts
-  });
-  const rW=r.w-o.bw, rH=r.h-o.bh, nr=[];
-  if (rW < rH) {
-    if (rW>0.5) nr.push({x:r.x+o.bw, y:r.y,       w:rW,  h:o.bh});
-    if (rH>0.5) nr.push({x:r.x,      y:r.y+o.bh,  w:r.w, h:rH  });
-  } else {
-    if (rH>0.5) nr.push({x:r.x,      y:r.y+o.bh,  w:o.bw, h:rH });
-    if (rW>0.5) nr.push({x:r.x+o.bw, y:r.y,        w:rW,  h:r.h});
-  }
-  sheet.fr = sheet.fr.filter(x => x !== r).concat(nr);
-  return true;
-}
-
-function guillotinePack(parts, W, H, gap, rotSteps) {
+// ═══════════════════════════════════════════════════════════
+//  NEST PACK  —  Bottom-Left-Fill + real polygon collision
+//  (Deepnest-style: candidate-corner placement, exact NFP-lite
+//   overlap test instead of bounding-box-only guillotine cuts.
+//   This lets concave/irregular parts nest into each other's
+//   notches without ever visually overlapping.)
+// ═══════════════════════════════════════════════════════════
+function nestPack(parts, W, H, gap, rotSteps) {
   const items = [];
   parts.forEach((p, i) => {
     for (let q = 0; q < p.qty; q++)
-      items.push({ ...p, iid:`${p.id}_${q}`, ci:i%PAL.length });
+      items.push({ ...p, iid:`${p.id}_${q}`, ci: i % PAL.length });
   });
   items.sort((a,b) => b.w*b.h - a.w*a.h || Math.max(b.w,b.h) - Math.max(a.w,a.h));
-  const sheets=[], skipped=[];
+
+  const sheets  = [];
+  const skipped = [];
+
+  function addCandidate(sheet, x, y) {
+    if (x < -0.01 || y < -0.01) return;
+    if (sheet.candidates.length > 4000) return;
+    for (const c of sheet.candidates)
+      if (Math.abs(c.x-x) < 0.3 && Math.abs(c.y-y) < 0.3) return;
+    sheet.candidates.push({ x, y });
+  }
+
+  function tryPlace(sheet, item, orients) {
+    const order = [...sheet.candidates].sort((a,b) => (a.y-b.y) || (a.x-b.x));
+    for (const cand of order) {
+      for (const o of orients) {
+        const x = cand.x, y = cand.y;
+        if (x + o.bw > W + 1e-6 || y + o.bh > H + 1e-6) continue;
+        const absPoly = o.collisionPts.map(p => ({ x: p.x + x, y: p.y + y }));
+        let hit = false;
+        for (const pl of sheet.placed) {
+          if (x + o.bw <= pl.bx || pl.bx + pl.bw <= x ||
+              y + o.bh <= pl.by || pl.by + pl.bh <= y) continue;
+          if (polysOverlap(absPoly, pl.absPoly)) { hit = true; break; }
+        }
+        if (hit) continue;
+
+        sheet.placed.push({
+          iid:item.iid, pid:item.id, name:item.name,
+          x, y, pw:o.pw, ph:o.ph, rot:o.rot, ci:item.ci,
+          polyPts:o.polyPts, holePts:o.holePts,
+          bx:x, by:y, bw:o.bw, bh:o.bh, absPoly,
+        });
+        addCandidate(sheet, x + o.bw, y);
+        addCandidate(sheet, x, y + o.bh);
+        return true;
+      }
+    }
+    return false;
+  }
+
   for (const it of items) {
-    const ors = getOrients(it, gap, rotSteps);
-    if (!ors.some(o => o.bw<=W+0.001 && o.bh<=H+0.001)) { skipped.push(it); continue; }
+    const orients = getOrients(it, gap, rotSteps);
+    const fits = orients.some(o => o.bw <= W+1e-6 && o.bh <= H+1e-6);
+    if (!fits) { skipped.push(it); continue; }
+
     let placed = false;
-    for (const sh of sheets) if (placeItem(it,sh,W,H,gap,rotSteps)) { placed=true; break; }
+    for (const sh of sheets) {
+      if (tryPlace(sh, it, orients)) { placed = true; break; }
+    }
     if (!placed) {
-      const sh = { fr:[{x:0,y:0,w:W,h:H}], pl:[] };
+      const sh = { placed:[], candidates:[{x:0,y:0}] };
       sheets.push(sh);
-      placeItem(it, sh, W, H, gap, rotSteps);
+      tryPlace(sh, it, orients);
     }
   }
-  return { sheets:sheets.map((s,i) => ({id:i+1, pl:s.pl})), skipped };
+
+  return { sheets: sheets.map((s,i) => ({ id:i+1, pl:s.placed })), skipped };
 }
 
 // ═══════════════════════════════════════════════════════════
 //  SVG SHEET CANVAS
 // ═══════════════════════════════════════════════════════════
-function SheetSVG({ data, W, H, sc, labels }) {
+function SheetSVG({ data, W, H, sc, labels, T, hoveredPid, onHoverPart }) {
   const sw = W*sc, sh = H*sc;
   const gMm = W > 2000 ? 200 : W > 800 ? 100 : 50;
   return (
-    <svg width={sw} height={sh} style={{ display:"block", borderRadius:2 }}>
+    <svg width={sw} height={sh} style={{ display:"block", borderRadius:2, flexShrink:0 }}>
       <defs>
-        <pattern id="cncDots" x={0} y={0}
+        <pattern id={`cncDots-${T.pageBg.slice(1)}`} x={0} y={0}
           width={gMm*sc} height={gMm*sc} patternUnits="userSpaceOnUse">
-          <circle cx={gMm*sc} cy={gMm*sc} r={0.8} fill="#0b2040"/>
+          <circle cx={gMm*sc} cy={gMm*sc} r={0.8} fill={T.dotColor}/>
         </pattern>
       </defs>
-      <rect width={sw} height={sh} fill="#030c18"/>
-      <rect width={sw} height={sh} fill="url(#cncDots)"/>
+      <rect width={sw} height={sh} fill={T.sheetBg}/>
+      <rect width={sw} height={sh} fill={`url(#cncDots-${T.pageBg.slice(1)})`}/>
       {[1,2,3,4,5,6].map(i => i*gMm).filter(x => x < W).map(x => (
         <line key={x} x1={x*sc} y1={sh-5} x2={x*sc} y2={sh}
-          stroke="#0d2545" strokeWidth={1}/>
+          stroke={T.border} strokeWidth={1}/>
       ))}
 
       {data?.pl.map(p => {
         const bx=p.x*sc, by=p.y*sc, bw=p.pw*sc, bh=p.ph*sc;
-        const col    = PAL[p.ci];
-        const fz     = Math.max(6, Math.min(12, bw/4.5, bh/3.2));
-        const hasTxt = labels && bw > 24 && bh > 14;
-        const hasDim = labels && bw > 52 && bh > 28;
+        const col      = PAL[p.ci];
+        const hovered  = hoveredPid !== null && p.pid === hoveredPid;
+        const fz       = Math.max(7, Math.min(13, bw/4.5, bh/3.2));
+        const hasTxt   = labels && bw > 16 && bh > 11;
+        const instNum  = +(p.iid?.split('_').pop()||0) + 1;
+        const strokeW  = hovered ? 2.6 : 1.4;
+
+        const evtProps = {
+          onMouseEnter: () => onHoverPart && onHoverPart(p.pid),
+          onMouseLeave: () => onHoverPart && onHoverPart(null),
+          style:{ cursor:"pointer" },
+        };
 
         if (p.polyPts) {
           const ptToStr = (pt, i) =>
@@ -746,82 +792,61 @@ function SheetSVG({ data, W, H, sc, labels }) {
           const holesD  = (p.holePts||[]).map(hole =>
             hole.map(ptToStr).join(' ') + ' Z'
           ).join(' ');
-          // Instance label: extract the 0-based index from iid ("partId_index")
-          const instNum = +(p.iid?.split('_').pop()||0) + 1;
-          const holeCount = (p.holePts||[]).length;
           return (
-            <g key={p.iid}>
+            <g key={p.iid} {...evtProps}>
               <path d={outerD + ' ' + holesD}
                 fillRule="evenodd"
-                fill={col} fillOpacity={0.18}
-                stroke={col} strokeWidth={1.4}/>
+                fill={col} fillOpacity={hovered ? 0.38 : 0.18}
+                stroke={col} strokeWidth={strokeW}/>
               {(p.holePts||[]).map((hole, hi) => (
                 <path key={hi}
                   d={hole.map(ptToStr).join(' ') + ' Z'}
                   fill="none" stroke={col} strokeWidth={0.7}
                   strokeDasharray="3 2" opacity={0.5}/>
               ))}
-              <rect x={bx+1} y={by+1}
-                width={Math.max(0,bw-2)} height={Math.max(0,bh-2)}
-                fill="none" stroke={col} strokeWidth={0.5}
-                strokeDasharray="4 3" opacity={0.18}/>
               {hasTxt && (
                 <text x={bx+bw/2} y={by+bh/2}
                   textAnchor="middle" dominantBaseline="middle"
                   fill={col} fontSize={fz}
                   fontFamily="'JetBrains Mono','Courier New',monospace"
-                  fontWeight={700} fillOpacity={0.9}>
+                  fontWeight={700} fillOpacity={0.95}
+                  style={{pointerEvents:"none"}}>
                   {instNum}
-                  {holeCount > 0 &&
-                    <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{holeCount}</tspan>}
                 </text>
               )}
             </g>
           );
         }
 
-        // ── Rectangle part ──────────────────────────────
-        const instNum = +(p.iid?.split('_').pop()||0) + 1;
-        const ra = Math.round(p.rot||0);
-        const holeCount = (p.holePts||[]).length;
         return (
-          <g key={p.iid}>
+          <g key={p.iid} {...evtProps}>
             <rect x={bx+1} y={by+1}
               width={Math.max(0,bw-2)} height={Math.max(0,bh-2)}
-              fill={col} fillOpacity={0.1}
-              stroke={col} strokeWidth={1.2} rx={1.5}/>
+              fill={col} fillOpacity={hovered ? 0.32 : 0.1}
+              stroke={col} strokeWidth={strokeW} rx={1.5}/>
             <rect x={bx+1} y={by+1}
               width={Math.max(0,bw-2)}
               height={Math.min(3.5, Math.max(0,bh-2))}
-              fill={col} fillOpacity={0.85} rx={1.5}/>
+              fill={col} fillOpacity={0.85} rx={1.5}
+              style={{pointerEvents:"none"}}/>
             {hasTxt && (
-              <text x={bx+bw/2} y={by+bh/2-(hasDim?fz*0.6:0)}
+              <text x={bx+bw/2} y={by+bh/2}
                 textAnchor="middle" dominantBaseline="middle"
                 fill={col} fontSize={fz}
                 fontFamily="'JetBrains Mono','Courier New',monospace"
-                fontWeight={700} fillOpacity={0.9}>
-                {ra > 0 ? `↺ ` : ''}{instNum}
-                {holeCount > 0 &&
-                  <tspan fontSize={fz-2} fillOpacity={0.5}> ⌀{holeCount}</tspan>}
-              </text>
-            )}
-            {hasDim && (
-              <text x={bx+bw/2} y={by+bh/2+fz*0.75}
-                textAnchor="middle" dominantBaseline="middle"
-                fill={col} fontSize={Math.max(5,fz-2)}
-                fontFamily="'JetBrains Mono','Courier New',monospace"
-                fillOpacity={0.45}>
-                {Math.round(p.pw)}×{Math.round(p.ph)}
+                fontWeight={700} fillOpacity={0.95}
+                style={{pointerEvents:"none"}}>
+                {instNum}
               </text>
             )}
           </g>
         );
       })}
 
-      <rect width={sw} height={sh} fill="none" stroke="#0d2545" strokeWidth={2}/>
-      <text x={sw/2} y={sh-1} textAnchor="middle" fill="#0d2545"
+      <rect width={sw} height={sh} fill="none" stroke={T.border} strokeWidth={2}/>
+      <text x={sw/2} y={sh-1} textAnchor="middle" fill={T.border}
         fontSize={8} fontFamily="monospace">{W} мм</text>
-      <text x={4} y={sh/2} textAnchor="middle" fill="#0d2545"
+      <text x={4} y={sh/2} textAnchor="middle" fill={T.border}
         fontSize={8} fontFamily="monospace"
         transform={`rotate(-90,4,${sh/2})`}>{H} мм</text>
     </svg>
@@ -831,7 +856,6 @@ function SheetSVG({ data, W, H, sc, labels }) {
 // ═══════════════════════════════════════════════════════════
 //  EXPORT GENERATORS
 // ═══════════════════════════════════════════════════════════
-
 function escapeXml(s) {
   return String(s)
     .replace(/&/g,"&amp;").replace(/</g,"&lt;")
@@ -852,14 +876,10 @@ function dlFile(content, filename, mime) {
   a.click();
 }
 
-// ── SVG ─────────────────────────────────────────────────────
-// All sheets side-by-side in one SVG file. Coordinates are
-// in mm (viewBox = sheet dimensions). Y-down matches SVG spec,
-// so screen coords can be used directly — no Y-flip needed.
 function generateAllSVG(sheets, W, H) {
-  const sheetGap = 40;  // mm between sheets
-  const padTop   = 14;  // space above for sheet labels
-  const padBot   = 12;  // space below for dimension text
+  const sheetGap = 40;
+  const padTop   = 14;
+  const padBot   = 12;
   const totalW   = sheets.length * W + (sheets.length - 1) * sheetGap;
   const totalH   = H + padTop + padBot;
 
@@ -876,7 +896,6 @@ function generateAllSVG(sheets, W, H) {
   L.push(`.rc{fill:none;stroke:#1e40af;stroke-width:0.35}`);
   L.push(`.pf{fill:#ede9fe;opacity:.65}`);
   L.push(`.pc{fill:none;stroke:#5b21b6;stroke-width:0.35}`);
-  L.push(`.bb{fill:none;stroke:#5b21b6;stroke-width:0.2;stroke-dasharray:2 2;opacity:.4}`);
   L.push(`.lbl{font:5.5px "Courier New",monospace;text-anchor:middle;dominant-baseline:middle;fill:#1e3a8a}`);
   L.push(`.plbl{font:5.5px "Courier New",monospace;text-anchor:middle;dominant-baseline:middle;fill:#4c1d95}`);
   L.push(`.shd{font:bold 7px "Helvetica Neue",sans-serif;text-anchor:middle;fill:#475569}`);
@@ -887,23 +906,19 @@ function generateAllSVG(sheets, W, H) {
   const gMm = W > 2000 ? 200 : 100;
 
   sheets.forEach((sheet, si) => {
-    const ox  = si * (W + sheetGap);  // sheet X offset
-    const oy  = padTop;               // sheet Y offset (below label)
+    const ox  = si * (W + sheetGap);
+    const oy  = padTop;
     const eff = sheet.pl.reduce((s,p)=>s+p.pw*p.ph,0) / (W*H) * 100;
 
     L.push(`\n<!-- ═ ЛИСТ ${sheet.id} ═ -->`);
     L.push(`<g id="sheet${sheet.id}">`);
-
-    // Background
     L.push(`  <rect class="bg" x="${ox}" y="${oy}" width="${W}" height="${H}"/>`);
 
-    // Grid
     for (let x = gMm; x < W; x += gMm)
       L.push(`  <line class="grid" x1="${ox+x}" y1="${oy}" x2="${ox+x}" y2="${oy+H}"/>`);
     for (let y = gMm; y < H; y += gMm)
       L.push(`  <line class="grid" x1="${ox}" y1="${oy+y}" x2="${ox+W}" y2="${oy+y}"/>`);
 
-    // Parts
     for (const p of sheet.pl) {
       const ra  = Math.round(p.rot||0);
       const lbl = escapeXml(ra > 0 ? `${p.name} ${ra}°` : p.name);
@@ -914,8 +929,6 @@ function generateAllSVG(sheets, W, H) {
           .map(pt => `${(ox+p.x+pt.x).toFixed(2)},${(oy+p.y+pt.y).toFixed(2)}`)
           .join(" ");
         L.push(`  <polygon class="pf pc" points="${pts}"/>`);
-        // Ghost bounding box
-        L.push(`  <rect class="bb" x="${bx.toFixed(2)}" y="${by.toFixed(2)}" width="${bw.toFixed(2)}" height="${bh.toFixed(2)}"/>`);
         if (bw > 22 && bh > 11)
           L.push(`  <text class="plbl" x="${(bx+bw/2).toFixed(2)}" y="${(by+bh/2).toFixed(2)}">${lbl}</text>`);
       } else {
@@ -926,10 +939,8 @@ function generateAllSVG(sheets, W, H) {
       }
     }
 
-    // Labels & dimensions
     L.push(`  <text class="shd" x="${ox+W/2}" y="${oy-4}">Лист ${sheet.id}  ·  КПД ${eff.toFixed(1)}%  ·  ${sheet.pl.length} дет.</text>`);
     L.push(`  <text class="dim" x="${ox+W/2}" y="${oy+H+7}">${W} мм</text>`);
-
     L.push(`</g>`);
   });
 
@@ -937,40 +948,27 @@ function generateAllSVG(sheets, W, H) {
   return L.join("\n");
 }
 
-// ── DXF ─────────────────────────────────────────────────────
-// Format: AC1009 (R12) — максимальная совместимость.
-// Не требует subclass-маркеров (100 AcDb…).
-// Контуры: POLYLINE/VERTEX/SEQEND.
-// Отверстия: отдельный слой HOLES (можно скрыть в CAM).
-// Y: screen Y-down → DXF Y-up: y_dxf = H − y_screen.
 function generateDXF(sheets, W, H) {
   const lines = [];
-  // Каждый аргумент — отдельная строка в файле
   const w = (...args) => args.forEach(a => lines.push(String(a)));
+  const sheetGap = 100;
 
-  const sheetGap = 100; // мм между листами по X
-
-  // ── HEADER ────────────────────────────────────────────────
   w("0","SECTION","2","HEADER");
-  w("9","$ACADVER","1","AC1009");       // R12
-  w("9","$INSUNITS","70","4");          // 4 = мм
-  w("9","$LUNITS","70","2");            // decimal
-  w("9","$MEASUREMENT","70","1");       // metric
+  w("9","$ACADVER","1","AC1009");
+  w("9","$INSUNITS","70","4");
+  w("9","$LUNITS","70","2");
+  w("9","$MEASUREMENT","70","1");
   w("0","ENDSEC");
 
-  // ── TABLES ────────────────────────────────────────────────
   const layerSet = new Set(["0","SHEET","LABELS","HOLES"]);
   sheets.forEach(sh => sh.pl.forEach(p => layerSet.add(sanitizeLayer(p.name))));
 
   w("0","SECTION","2","TABLES");
-
-  // LTYPE
   w("0","TABLE","2","LTYPE","70","1");
   w("0","LTYPE");
   w("2","CONTINUOUS","70","0","3","Solid line","72","65","73","0","40","0.0");
   w("0","ENDTAB");
 
-  // LAYER
   w("0","TABLE","2","LAYER","70",String(layerSet.size));
   const lyColor = { "0":7, SHEET:3, LABELS:9, HOLES:6 };
   layerSet.forEach(nm => {
@@ -981,18 +979,15 @@ function generateDXF(sheets, W, H) {
     w("6","CONTINUOUS");
   });
   w("0","ENDTAB");
-
   w("0","ENDSEC");
 
-  // ── ENTITIES ──────────────────────────────────────────────
   w("0","SECTION","2","ENTITIES");
 
-  // R12 POLYLINE / VERTEX / SEQEND
   const r12poly = (layer, pts, closed = true) => {
     w("0","POLYLINE");
     w("8",layer);
-    w("66","1");                        // vertices follow
-    w("70", closed ? "1" : "0");        // 1 = замкнута
+    w("66","1");
+    w("70", closed ? "1" : "0");
     pts.forEach(([x,y]) => {
       w("0","VERTEX");
       w("8",layer);
@@ -1004,9 +999,7 @@ function generateDXF(sheets, W, H) {
     w("8",layer);
   };
 
-  // R12 TEXT (простой, без выравнивания — самый совместимый вариант)
   const r12text = (layer, x, y, h, txt) => {
-    // Заменяем не-ASCII (кириллицу) на латинские эквиваленты в метке
     const safe = txt.replace(/[^\x20-\x7E]/g, "?");
     if (!safe.trim()) return;
     w("0","TEXT");
@@ -1018,13 +1011,11 @@ function generateDXF(sheets, W, H) {
     w("1",safe);
   };
 
-  // Y-flip: экранные координаты (Y-вниз) → DXF (Y-вверх)
   const fy = y => H - y;
 
   sheets.forEach((sheet, si) => {
     const ox = si * (W + sheetGap);
 
-    // Граница листа
     r12poly("SHEET", [
       [ox,    fy(0)],
       [ox+W,  fy(0)],
@@ -1038,12 +1029,10 @@ function generateDXF(sheets, W, H) {
       const lbl = ra > 0 ? `${p.name.replace(/[^\x20-\x7E]/g,"?")} ${ra}d` : p.name.replace(/[^\x20-\x7E]/g,"?");
 
       if (p.polyPts) {
-        // Внешний контур полигона
         r12poly(layer, p.polyPts.map(pt => [
           ox + p.x + pt.x,
           fy(p.y + pt.y),
         ]));
-        // Отверстия — отдельный слой HOLES
         (p.holePts || []).forEach(hole => {
           r12poly("HOLES", hole.map(pt => [
             ox + p.x + pt.x,
@@ -1051,7 +1040,6 @@ function generateDXF(sheets, W, H) {
           ]));
         });
       } else {
-        // Прямоугольная деталь — 4 угла
         r12poly(layer, [
           [ox+p.x,       fy(p.y)      ],
           [ox+p.x+p.pw,  fy(p.y)      ],
@@ -1060,7 +1048,6 @@ function generateDXF(sheets, W, H) {
         ]);
       }
 
-      // Подпись на слое LABELS (в CAM скрыть этот слой)
       const th = Math.max(2, Math.min(8, p.ph*0.28, p.pw/(lbl.length*0.65+1)));
       r12text("LABELS", ox+p.x+p.pw/2, fy(p.y+p.ph/2), th, lbl);
     }
@@ -1073,21 +1060,9 @@ function generateDXF(sheets, W, H) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  HELPERS
+//  STYLE HELPERS
 // ═══════════════════════════════════════════════════════════
-const inp = (ext={}) => ({
-  background:"#030c18", border:"1px solid #0d2545", borderRadius:3,
-  padding:"4px 7px", color:"#7fa8cc", fontSize:11, outline:"none",
-  boxSizing:"border-box",
-  fontFamily:"'JetBrains Mono','Courier New',monospace", ...ext,
-});
 const effColor = v => v > 80 ? "#10b981" : v > 60 ? "#f59e0b" : "#ef4444";
-const CAP = {
-  fontSize:9, letterSpacing:"0.15em", color:"#1a3a5c",
-  fontFamily:"'JetBrains Mono','Courier New',monospace",
-  display:"block", marginBottom:6,
-};
-const DIV = { borderTop:"1px solid #0d2545", margin:"8px 0" };
 
 // ═══════════════════════════════════════════════════════════
 //  MAIN APP
@@ -1098,11 +1073,10 @@ export default function App() {
   const [H,       setH]       = useState(1220);
   const [gap,     setGap]     = useState(3);
   const [res,     setRes]     = useState(null);
-  const [cur,     setCur]     = useState(0);
   const [busy,    setBusy]    = useState(false);
   const [dirty,   setDirty]   = useState(false);
   const [labels,  setLabels]  = useState(true);
-  const [sc,      setSc]      = useState(0.25);
+  const [sc,      setSc]      = useState(0.2);
   const [nid,     setNid]     = useState(5);
   const [form,    setForm]    = useState({ name:"", w:"", h:"", qty:"1", rot:true });
   const [eid,     setEid]     = useState(null);
@@ -1111,23 +1085,27 @@ export default function App() {
   const [arcTol,  setArcTol]  = useState(1.0);
   const [expOpen, setExpOpen] = useState(false);
   const [zoom,    setZoom]    = useState(1);
-  const [panX,    setPanX]    = useState(0);
-  const [panY,    setPanY]    = useState(0);
+  const [panX,    setPanX]    = useState(40);
+  const [panY,    setPanY]    = useState(30);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
-  // Custom sheet sizes — persisted to localStorage in Electron
+  const [theme,   setTheme]   = useState("dark");
+  const [hoveredPid, setHoveredPid] = useState(null);
   const [customSheets, setCustomSheets] = useState(() => {
     try { return JSON.parse(localStorage.getItem('cncnest_sheets') || '[]'); }
     catch { return []; }
   });
   const [customForm, setCustomForm] = useState({ n:"", w:"", h:"" });
+
   const fileRef   = useRef();
   const expRef    = useRef();
   const canvasRef = useRef();
   const panRef    = useRef({ active:false, sx:0, sy:0, px:0, py:0 });
 
+  const T = THEMES[theme];
+
   useEffect(() => { runCalc(DEMO,2440,1220,3,4); }, []);
   useEffect(() => {
-    setSc(Math.max(0.05, Math.min(0.52, Math.min(614/W, 414/H)*0.92)));
+    setSc(Math.max(0.03, Math.min(0.32, Math.min(340/W, 340/H))));
   }, [W, H]);
 
   // ── CALCULATION ─────────────────────────────────────────
@@ -1136,7 +1114,7 @@ export default function App() {
     if (!valid.length) return;
     setBusy(true); setDirty(false);
     setTimeout(() => {
-      try { setRes(guillotinePack(valid,sW,sH,g,rs)); setCur(0); }
+      try { setRes(nestPack(valid,sW,sH,g,rs)); }
       catch(e) { console.error(e); }
       setBusy(false);
     }, 70);
@@ -1171,25 +1149,13 @@ export default function App() {
     setParts(p => p.map(x => x.id===id ? {...x, qty:q} : x));
     setDirty(true);
   };
+  const clearAllParts = () => {
+    if (!window.confirm('Очистить весь список деталей?')) return;
+    setParts([]); setRes(null); setDirty(false); cancelEdit();
+  };
 
   // ── ZOOM / PAN ───────────────────────────────────────────
-  const resetView = () => { setZoom(1); setPanX(0); setPanY(0); };
-
-  // ── CUSTOM SHEET SIZES ───────────────────────────────────
-  const addCustomSheet = () => {
-    const w = +customForm.w, h = +customForm.h;
-    if (!w || !h || w < 50 || h < 50) return;
-    const name = customForm.n.trim() || `${w} × ${h} мм`;
-    const updated = [...customSheets, { n:name, w, h }];
-    setCustomSheets(updated);
-    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
-    setCustomForm({ n:"", w:"", h:"" });
-  };
-  const removeCustomSheet = (idx) => {
-    const updated = customSheets.filter((_,i) => i !== idx);
-    setCustomSheets(updated);
-    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
-  };
+  const resetView = () => { setZoom(1); setPanX(40); setPanY(30); };
 
   const onCanvasWheel = (e) => {
     e.preventDefault();
@@ -1198,14 +1164,13 @@ export default function App() {
     const cx = e.clientX - rect.left;
     const cy = e.clientY - rect.top;
     setZoom(z => {
-      const nz = Math.max(0.1, Math.min(8, z * factor));
+      const nz = Math.max(0.05, Math.min(8, z * factor));
       const scale = nz / z;
       setPanX(px => cx - (cx - px) * scale);
       setPanY(py => cy - (cy - py) * scale);
       return nz;
     });
   };
-
   const onCanvasMouseDown = (e) => {
     if (e.button !== 0) return;
     panRef.current = { active:true, sx:e.clientX, sy:e.clientY, px:panX, py:panY };
@@ -1218,7 +1183,7 @@ export default function App() {
   const onCanvasMouseUp = () => { panRef.current.active = false; };
 
   // ── DRAG & DROP DXF ─────────────────────────────────────
-  const onDragOver = (e) => { e.preventDefault(); setIsDraggingOver(true); };
+  const onDragOver  = (e) => { e.preventDefault(); setIsDraggingOver(true); };
   const onDragLeave = () => setIsDraggingOver(false);
   const onDrop = (e) => {
     e.preventDefault(); setIsDraggingOver(false);
@@ -1249,7 +1214,6 @@ export default function App() {
           }
           alert(msg); return;
         }
-        // Group outer contours with their holes
         const grouped = groupContours(shapes);
         let id = nid;
         const baseName = file.name.replace(/\.dxf$/i,"");
@@ -1274,16 +1238,12 @@ export default function App() {
 
   // ── DEMO POLYGON SHAPES ─────────────────────────────────
   function addDemoPolygons() {
-    // L-shape (400×300 with 200×150 notch)
     const lRaw = [{x:0,y:0},{x:400,y:0},{x:400,y:150},{x:200,y:150},{x:200,y:300},{x:0,y:300}];
     const lPoly = normPoly(lRaw); const lBB = getBBox(lPoly);
-    // T-shape
     const tRaw = [{x:0,y:0},{x:500,y:0},{x:500,y:100},{x:300,y:100},{x:300,y:300},{x:200,y:300},{x:200,y:100},{x:0,y:100}];
     const tPoly = normPoly(tRaw); const tBB = getBBox(tPoly);
-    // Regular hexagon r=120
     const hexPoly = normPoly(Array.from({length:6},(_,i)=>{const a=Math.PI/6+i*Math.PI/3;return{x:120*Math.cos(a),y:120*Math.sin(a)};}));
     const hexBB = getBBox(hexPoly);
-    // Arc-rounded rectangle (16-segment arch top)
     const archRaw = [];
     for(let i=0;i<=8;i++){const a=Math.PI*i/8;archRaw.push({x:100+100*Math.cos(Math.PI-a),y:200+100*Math.sin(Math.PI-a)});}
     archRaw.push({x:200,y:0},{x:0,y:0});
@@ -1307,7 +1267,7 @@ export default function App() {
     const tA = sheets.reduce((s,sh)=>s+sh.pl.reduce((a,p)=>a+p.pw*p.ph,0),0);
     const lines = [
       "══════════════════════════════════════",
-      "  CNCnest PRO v2  —  КАРТА РАСКРОЯ",
+      "  CNCnest PRO v3  —  КАРТА РАСКРОЯ",
       "══════════════════════════════════════","",
       `Лист:           ${W} × ${H} мм`,
       `Зазор / рез:    ${gap} мм`,
@@ -1324,8 +1284,7 @@ export default function App() {
         `  ${p.name.padEnd(16)} X:${String(Math.round(p.x)).padStart(5)}` +
         `  Y:${String(Math.round(p.y)).padStart(5)}` +
         `  ${Math.round(p.pw)}×${Math.round(p.ph)} мм` +
-        `  угол: ${Math.round(p.rot||0)}°` +
-        (p.polyPts ? " [полигон]" : "")
+        `  угол: ${Math.round(p.rot||0)}°`
       ));
       lines.push("");
     });
@@ -1335,7 +1294,7 @@ export default function App() {
     }
     const b = new Blob([lines.join("\n")], {type:"text/plain;charset=utf-8"});
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(b); a.download = "cnc_nesting_v2.txt"; a.click();
+    a.href = URL.createObjectURL(b); a.download = "cnc_nesting_v3.txt"; a.click();
   }
 
   // ── COMPUTED ────────────────────────────────────────────
@@ -1343,11 +1302,9 @@ export default function App() {
   const shA     = W * H;
   const totA    = sheets.reduce((s,sh)=>s+sh.pl.reduce((a,p)=>a+p.pw*p.ph,0),0);
   const eff     = sheets.length ? totA/(sheets.length*shA)*100 : 0;
-  const curSh   = sheets[cur];
-  const curEff  = curSh ? curSh.pl.reduce((s,p)=>s+p.pw*p.ph,0)/shA*100 : 0;
   const show    = res && !dirty;
+  const totalParts = sheets.reduce((s,sh)=>s+sh.pl.length,0);
 
-  // Close export dropdown when clicking outside
   useEffect(() => {
     if (!expOpen) return;
     const handler = e => { if (expRef.current && !expRef.current.contains(e.target)) setExpOpen(false); };
@@ -1355,81 +1312,102 @@ export default function App() {
     return () => document.removeEventListener("mousedown", handler);
   }, [expOpen]);
 
-  // ── DOWNLOAD SVG ────────────────────────────────────────
   function downloadSVG() {
     if (!show) return;
     setExpOpen(false);
     dlFile(generateAllSVG(sheets, W, H), "cnc_nesting.svg", "image/svg+xml");
   }
-
-  // ── DOWNLOAD DXF ────────────────────────────────────────
   function downloadDXF() {
     if (!show) return;
     setExpOpen(false);
     dlFile(generateDXF(sheets, W, H), "cnc_nesting.dxf", "application/dxf");
   }
-
-  // ── DOWNLOAD TXT ────────────────────────────────────────
   function downloadTXT() {
     setExpOpen(false);
     exportReport();
   }
 
-  const PBG = { background:"#050e1c", flexShrink:0 };
+  // ── CUSTOM SHEET SIZES ───────────────────────────────────
+  const addCustomSheet = () => {
+    const w = +customForm.w, h = +customForm.h;
+    if (!w || !h || w < 50 || h < 50) return;
+    const name = customForm.n.trim() || `${w} × ${h} мм`;
+    const updated = [...customSheets, { n:name, w, h }];
+    setCustomSheets(updated);
+    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
+    setCustomForm({ n:"", w:"", h:"" });
+  };
+  const removeCustomSheet = (idx) => {
+    const updated = customSheets.filter((_,i) => i !== idx);
+    setCustomSheets(updated);
+    try { localStorage.setItem('cncnest_sheets', JSON.stringify(updated)); } catch {}
+  };
+
+  const inp = (ext={}) => ({
+    background:T.inputBg, border:`1px solid ${T.border}`, borderRadius:3,
+    padding:"4px 7px", color:T.textSecondary, fontSize:11, outline:"none",
+    boxSizing:"border-box",
+    fontFamily:"'JetBrains Mono','Courier New',monospace", ...ext,
+  });
+  const CAP = {
+    fontSize:9, letterSpacing:"0.15em", color:T.textMuted,
+    fontFamily:"'JetBrains Mono','Courier New',monospace",
+    display:"block", marginBottom:6,
+  };
+  const DIV = { borderTop:`1px solid ${T.border}`, margin:"8px 0" };
+  const PBG = { background:T.panelBg, flexShrink:0 };
 
   // ════════════════════════════════════════════════════════
   return (
     <div style={{height:"100vh",display:"flex",flexDirection:"column",
-      background:"#030c18",color:"#7fa8cc",overflow:"hidden",
+      background:T.pageBg,color:T.textSecondary,overflow:"hidden",
       fontFamily:"'Barlow','Helvetica Neue',Helvetica,sans-serif"}}>
 
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
         *{box-sizing:border-box}
-        input[type=range]{accent-color:#00e5ff}
-        input[type=checkbox],input[type=radio]{accent-color:#00e5ff;cursor:pointer}
-        select option{background:#030c18}
-        ::-webkit-scrollbar{width:4px;background:#030c18}
-        ::-webkit-scrollbar-thumb{background:#0d2545;border-radius:2px}
-        @keyframes scan{0%{top:-3px}100%{top:100%}}
+        input[type=range]{accent-color:${T.accent}}
+        input[type=checkbox],input[type=radio]{accent-color:${T.accent};cursor:pointer}
+        select option{background:${T.panelBg};color:${T.textSecondary}}
+        ::-webkit-scrollbar{width:4px;background:${T.pageBg}}
+        ::-webkit-scrollbar-thumb{background:${T.border};border-radius:2px}
         @keyframes blink{0%,100%{opacity:.45}50%{opacity:1}}
         button:focus{outline:none}
       `}</style>
 
       {/* ══════════ HEADER ══════════ */}
-      <div style={{height:46,...PBG,borderBottom:"1px solid #0d2545",
+      <div style={{height:46,...PBG,borderBottom:`1px solid ${T.border}`,
         display:"flex",alignItems:"center",padding:"0 16px",gap:14}}>
 
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <svg width={22} height={22} viewBox="0 0 22 22">
-            <circle cx={11} cy={11} r={9}   fill="none" stroke="#00e5ff" strokeWidth={1.4}/>
-            <circle cx={11} cy={11} r={3.5} fill="none" stroke="#00e5ff" strokeWidth={1}/>
+            <circle cx={11} cy={11} r={9}   fill="none" stroke={T.accent} strokeWidth={1.4}/>
+            <circle cx={11} cy={11} r={3.5} fill="none" stroke={T.accent} strokeWidth={1}/>
             {[[11,2,11,6],[11,16,11,20],[2,11,6,11],[16,11,20,11]].map(([x1,y1,x2,y2],i)=>(
-              <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke="#00e5ff" strokeWidth={1.4}/>
+              <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={T.accent} strokeWidth={1.4}/>
             ))}
           </svg>
           <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:900,
-            fontSize:18,letterSpacing:"0.06em",color:"#d4eeff"}}>CNCNEST</span>
-          <span style={{fontSize:9,fontFamily:"'JetBrains Mono',monospace",color:"#00e5ff",
-            border:"1px solid #00e5ff33",padding:"1px 5px",borderRadius:2}}>PRO v2</span>
+            fontSize:18,letterSpacing:"0.06em",color:T.textPrimary}}>CNCNEST</span>
+          <span style={{fontSize:9,fontFamily:"'JetBrains Mono',monospace",color:T.accent,
+            border:`1px solid ${T.accent}44`,padding:"1px 5px",borderRadius:2}}>PRO v3</span>
         </div>
 
         <div style={{flex:1}}/>
 
         {show && <>
           {[
-            ["ЛИСТОВ",  sheets.length,                               null],
-            ["ДЕТАЛЕЙ", sheets.reduce((s,sh)=>s+sh.pl.length,0),    null],
-            ["КПД",     `${eff.toFixed(1)}%`,                        effColor(eff)],
-            ["ШАГ",     `${(360/rotSteps).toFixed(0)}°`,            "#a78bfa"],
+            ["ЛИСТОВ",  sheets.length,            null],
+            ["ДЕТАЛЕЙ", totalParts,                null],
+            ["КПД",     `${eff.toFixed(1)}%`,      effColor(eff)],
+            ["ШАГ",     `${(360/rotSteps).toFixed(0)}°`, "#a78bfa"],
           ].map(([k,v,c]) => (
             <div key={k} style={{textAlign:"center",lineHeight:1.25}}>
               <div style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,
-                fontSize:14,color:c||"#00e5ff"}}>{v}</div>
-              <div style={{fontSize:9,letterSpacing:"0.1em",color:"#1a3a5c"}}>{k}</div>
+                fontSize:14,color:c||T.accent}}>{v}</div>
+              <div style={{fontSize:9,letterSpacing:"0.1em",color:T.textMuted}}>{k}</div>
             </div>
           ))}
-          <div style={{width:1,height:22,background:"#0d2545"}}/>
+          <div style={{width:1,height:22,background:T.border}}/>
         </>}
 
         {dirty&&res && (
@@ -1439,13 +1417,22 @@ export default function App() {
           </span>
         )}
 
-        {/* ── Export dropdown ──────────────────────────── */}
+        {/* Theme toggle */}
+        <button onClick={()=>setTheme(t=>t==='dark'?'light':'dark')}
+          title="Переключить тему"
+          style={{background:"none",border:`1px solid ${T.border}`,
+            color:T.textSecondary,borderRadius:3,padding:"5px 9px",cursor:"pointer",
+            fontSize:14,display:"flex",alignItems:"center"}}>
+          {theme==='dark' ? '☀' : '☾'}
+        </button>
+
+        {/* Export dropdown */}
         <div ref={expRef} style={{position:"relative"}}>
           <button onClick={()=>setExpOpen(v=>!v)} disabled={!show}
             style={{
-              background: show?"#00e5ff08":"none",
-              border:`1px solid ${show?"#00e5ff44":"#06111f"}`,
-              color: show?"#00e5ff":"#0a1e35",
+              background: show?`${T.accent}12`:"none",
+              border:`1px solid ${show?T.accent+"44":T.textDim}`,
+              color: show?T.accent:T.textDim,
               borderRadius:3,padding:"5px 13px",
               cursor:show?"pointer":"default",
               fontFamily:"'Barlow Condensed',sans-serif",
@@ -1459,39 +1446,38 @@ export default function App() {
           {expOpen && (
             <div style={{
               position:"absolute",top:"calc(100% + 4px)",right:0,
-              background:"#050e1c",border:"1px solid #0d2545",
+              background:T.panelBg,border:`1px solid ${T.border}`,
               borderRadius:4,zIndex:200,minWidth:200,
-              boxShadow:"0 8px 32px rgba(0,0,0,.6)",overflow:"hidden",
+              boxShadow:"0 8px 32px rgba(0,0,0,.3)",overflow:"hidden",
             }}>
               {[
-                ["SVG","Векторная карта раскроя",  "image/svg+xml", "#10b981", downloadSVG],
-                ["DXF","Файл для CAM / станка",    "application/dxf","#00e5ff", downloadDXF],
-                ["TXT","Текстовый отчёт с коорд.", "text/plain",    "#a78bfa",  downloadTXT],
-              ].map(([fmt, desc, , col, fn]) => (
+                ["SVG","Векторная карта раскроя",  "#10b981", downloadSVG],
+                ["DXF","Файл для CAM / станка",    T.accent,  downloadDXF],
+                ["TXT","Текстовый отчёт с коорд.", "#a78bfa", downloadTXT],
+              ].map(([fmt, desc, col, fn]) => (
                 <button key={fmt} onClick={fn}
                   style={{
                     display:"flex",alignItems:"center",gap:10,
                     width:"100%",background:"none",
-                    border:"none",borderBottom:"1px solid #0d2545",
+                    border:"none",borderBottom:`1px solid ${T.border}`,
                     padding:"9px 12px",cursor:"pointer",textAlign:"left",
-                    transition:"background .1s",
                   }}
-                  onMouseEnter={e=>e.currentTarget.style.background="#0d2545"}
+                  onMouseEnter={e=>e.currentTarget.style.background=T.rowAlt}
                   onMouseLeave={e=>e.currentTarget.style.background="none"}>
                   <div style={{
                     fontFamily:"'JetBrains Mono',monospace",fontSize:11,
                     fontWeight:700,color:col,minWidth:32,
                   }}>{fmt}</div>
-                  <div style={{fontSize:10,color:"#4a6fa8",lineHeight:1.3}}>{desc}</div>
+                  <div style={{fontSize:10,color:T.textTertiary,lineHeight:1.3}}>{desc}</div>
                 </button>
               ))}
             </div>
           )}
         </div>
         <button onClick={doCalc} disabled={busy}
-          style={{background:busy?"transparent":"#00e5ff0e",
-            border:`1px solid ${busy?"#0d2545":"#00e5ff"}`,
-            color:busy?"#1a3a5c":"#00e5ff",borderRadius:3,padding:"5px 20px",
+          style={{background:busy?"transparent":`${T.accent}12`,
+            border:`1px solid ${busy?T.border:T.accent}`,
+            color:busy?T.textMuted:T.accent,borderRadius:3,padding:"5px 20px",
             cursor:busy?"wait":"pointer",fontFamily:"'Barlow Condensed',sans-serif",
             fontWeight:700,fontSize:14,letterSpacing:"0.1em"}}>
           {busy ? "⏳ РАСЧЁТ…" : "▶ РАССЧИТАТЬ"}
@@ -1502,16 +1488,15 @@ export default function App() {
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
 
         {/* ── LEFT PANEL ── */}
-        <div style={{width:256,...PBG,borderRight:"1px solid #0d2545",
+        <div style={{width:256,...PBG,borderRight:`1px solid ${T.border}`,
           display:"flex",flexDirection:"column",overflow:"hidden",
-          outline: isDraggingOver ? "2px solid #00e5ff" : "none",
-          background: isDraggingOver ? "#051420" : PBG.background}}
+          outline: isDraggingOver ? `2px solid ${T.accent}` : "none",
+          background: isDraggingOver ? T.rowAlt : PBG.background}}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
           onDrop={onDrop}>
 
-          {/* Sheet params (always visible) */}
-          <div style={{padding:"10px 12px",borderBottom:"1px solid #0d2545"}}>
+          <div style={{padding:"10px 12px",borderBottom:`1px solid ${T.border}`}}>
             <span style={CAP}>◈ ПАРАМЕТРЫ ЛИСТА</span>
             <select onChange={e=>{
                 const all = [...STD_SHEETS, ...customSheets];
@@ -1534,19 +1519,19 @@ export default function App() {
             <div style={{display:"flex",gap:5,marginBottom:5}}>
               {[["Ширина [мм]",W,v=>setSheet(+v,H)],["Высота [мм]",H,v=>setSheet(W,+v)]].map(([l,v,fn])=>(
                 <div key={l} style={{flex:1}}>
-                  <div style={{fontSize:9,color:"#1a3a5c",marginBottom:2}}>{l}</div>
+                  <div style={{fontSize:9,color:T.textMuted,marginBottom:2}}>{l}</div>
                   <input type="number" value={v} onChange={e=>fn(e.target.value)}
                     style={inp({width:"100%"})}/>
                 </div>
               ))}
               <div>
-                <div style={{fontSize:9,color:"#1a3a5c",marginBottom:2}}>Рез</div>
+                <div style={{fontSize:9,color:T.textMuted,marginBottom:2}}>Рез</div>
                 <input type="number" step="0.5" min="0" value={gap}
                   onChange={e=>{setGap(+e.target.value);setDirty(true);}}
                   style={inp({width:44})}/>
               </div>
             </div>
-            {/* ── Add current size to library ── */}
+
             <div style={{display:"flex",gap:4,marginTop:4}}>
               <input placeholder="Название (необязательно)" value={customForm.n}
                 onChange={e=>setCustomForm(f=>({...f,n:e.target.value}))}
@@ -1564,7 +1549,6 @@ export default function App() {
                 + СОХРАНИТЬ
               </button>
             </div>
-            {/* Custom sheets list */}
             {customSheets.length > 0 && (
               <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:3}}>
                 {customSheets.map((s,i) => (
@@ -1583,13 +1567,12 @@ export default function App() {
             )}
           </div>
 
-          {/* Tab bar */}
-          <div style={{display:"flex",borderBottom:"1px solid #0d2545",flexShrink:0}}>
+          <div style={{display:"flex",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
             {[["parts","ДЕТАЛИ"],["settings","НАСТРОЙКИ"]].map(([t,l])=>(
               <button key={t} onClick={()=>setTab(t)}
-                style={{flex:1,background:tab===t?"#030c18":"transparent",
-                  border:"none",borderBottom:`2px solid ${tab===t?"#00e5ff":"transparent"}`,
-                  color:tab===t?"#00e5ff":"#1a3a5c",padding:"7px",cursor:"pointer",
+                style={{flex:1,background:tab===t?T.pageBg:"transparent",
+                  border:"none",borderBottom:`2px solid ${tab===t?T.accent:"transparent"}`,
+                  color:tab===t?T.accent:T.textMuted,padding:"7px",cursor:"pointer",
                   fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
                   fontSize:11,letterSpacing:"0.1em"}}>
                 {l}
@@ -1597,15 +1580,13 @@ export default function App() {
             ))}
           </div>
 
-          {/* ═══ ДЕТАЛИ TAB ═══════════════════════════════ */}
           {tab === "parts" && <>
             <div style={{flex:1,overflowY:"auto",padding:"10px 12px"}}>
 
-              {/* Import row */}
               <div style={{display:"flex",gap:5,marginBottom:6}}>
                 <button onClick={()=>fileRef.current.click()}
-                  style={{flex:1,background:"#00e5ff0a",border:"1px solid #00e5ff33",
-                    color:"#00e5ff",borderRadius:2,padding:"5px 6px",cursor:"pointer",
+                  style={{flex:1,background:`${T.accent}0a`,border:`1px solid ${T.accent}33`,
+                    color:T.accent,borderRadius:2,padding:"5px 6px",cursor:"pointer",
                     fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
                     fontSize:12,letterSpacing:"0.06em"}}>
                   📁 ИМПОРТ DXF
@@ -1621,14 +1602,12 @@ export default function App() {
                     color:"#a78bfa",borderRadius:2,padding:"5px 7px",cursor:"pointer",
                     fontSize:13}}>⬡</button>
               </div>
-              {/* Drag & drop hint */}
               <div style={{
-                border:`1px dashed ${isDraggingOver?"#00e5ff":"#0d2545"}`,
+                border:`1px dashed ${isDraggingOver?T.accent:T.border}`,
                 borderRadius:3, padding:"5px 8px", marginBottom:8,
-                textAlign:"center", fontSize:9, color:"#1a3a5c",
+                textAlign:"center", fontSize:9, color:T.textMuted,
                 fontFamily:"'JetBrains Mono',monospace",
-                background: isDraggingOver?"#00e5ff0a":"transparent",
-                transition:"all .15s",
+                background: isDraggingOver?`${T.accent}0a`:"transparent",
               }}>
                 {isDraggingOver ? "⬇ Отпустите DXF файлы…" : "↑ или перетащите .dxf сюда"}
               </div>
@@ -1636,7 +1615,7 @@ export default function App() {
               <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
                 <span style={CAP}>◈ ДЕТАЛИ [{parts.length}]</span>
                 {parts.length > 0 && (
-                  <button onClick={()=>{ if(window.confirm('Очистить весь список деталей?')) { setParts([]); setRes(null); setDirty(false); cancelEdit(); }}}
+                  <button onClick={clearAllParts}
                     style={{background:"none",border:"1px solid #ef444433",
                       color:"#ef444488",borderRadius:2,padding:"1px 7px",
                       cursor:"pointer",fontSize:9,
@@ -1647,41 +1626,46 @@ export default function App() {
               </div>
 
               {parts.length===0 && (
-                <div style={{color:"#0d2545",textAlign:"center",marginTop:16,fontSize:11}}>
+                <div style={{color:T.textDim,textAlign:"center",marginTop:16,fontSize:11}}>
                   Список пуст
                 </div>
               )}
 
-              {parts.map((p,i) => (
-                <div key={p.id} style={{
-                  background:eid===p.id?"#05142a":"transparent",
-                  border:`1px solid ${eid===p.id?"#00e5ff33":"#0d2545"}`,
-                  borderLeft:`2px solid ${PAL[i%PAL.length]}`,
+              {parts.map((p,i) => {
+                const isHovered = hoveredPid === p.id;
+                return (
+                <div key={p.id}
+                  onMouseEnter={()=>setHoveredPid(p.id)}
+                  onMouseLeave={()=>setHoveredPid(null)}
+                  style={{
+                  background:eid===p.id?T.rowAlt:(isHovered?T.rowAlt:"transparent"),
+                  border:`1px solid ${eid===p.id?T.accent+"44":(isHovered?T.accent+"66":T.border)}`,
+                  borderLeft:`3px solid ${PAL[i%PAL.length]}`,
                   borderRadius:2,padding:"5px 8px",marginBottom:4,
+                  transition:"background .1s, border-color .1s",
                 }}>
                   <div style={{display:"flex",alignItems:"center",gap:4}}>
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
-                        fontSize:13,color:"#b8d4ee",overflow:"hidden",
+                        fontSize:13,color:T.textPrimary,overflow:"hidden",
                         textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                        {p.source==="dxf"  && <span style={{fontSize:9,color:"#a78bfa",marginRight:3}}>DXF</span>}
+                        {p.source==="dxf" && <span style={{fontSize:9,color:"#a78bfa",marginRight:3}}>DXF</span>}
                         {p.source==="demo" && <span style={{fontSize:9,color:"#f59e0b",marginRight:3}}>⬡</span>}
                         {p.name}
                       </div>
                       <div style={{display:"flex",alignItems:"center",gap:4,marginTop:2}}>
                         <span style={{fontFamily:"'JetBrains Mono',monospace",
-                          fontSize:9,color:"#1a3a5c"}}>
+                          fontSize:9,color:T.textMuted}}>
                           {Math.round(p.w)}×{Math.round(p.h)}мм
-                          {p.rot     && <span style={{color:"#00e5ff44",marginLeft:3}}>⟳</span>}
-                          {p.polygon && <span style={{color:"#a78bfa44",marginLeft:3}}>⬡</span>}
-                          {(p.holes||[]).length>0 && <span style={{color:"#f59e0b44",marginLeft:3}}>⌀{p.holes.length}</span>}
+                          {p.rot     && <span style={{color:T.accent+"88",marginLeft:3}}>⟳</span>}
+                          {p.polygon && <span style={{color:"#a78bfa88",marginLeft:3}}>⬡</span>}
+                          {(p.holes||[]).length>0 && <span style={{color:"#f59e0b88",marginLeft:3}}>⌀{p.holes.length}</span>}
                         </span>
-                        {/* Inline qty editor */}
                         <div style={{display:"flex",alignItems:"center",
                           marginLeft:"auto",gap:2}}>
                           <button
                             onClick={e=>{e.stopPropagation();changeQty(p.id,-1);}}
-                            style={{background:"#0d2545",border:"none",color:"#4a8ab5",
+                            style={{background:T.border,border:"none",color:T.textTertiary,
                               borderRadius:2,width:16,height:16,fontSize:11,
                               cursor:"pointer",lineHeight:"1",padding:0}}>−</button>
                           <input type="number" min="1" value={p.qty}
@@ -1691,24 +1675,23 @@ export default function App() {
                               padding:"1px 3px",fontSize:10})}}/>
                           <button
                             onClick={e=>{e.stopPropagation();changeQty(p.id,+1);}}
-                            style={{background:"#0d2545",border:"none",color:"#4a8ab5",
+                            style={{background:T.border,border:"none",color:T.textTertiary,
                               borderRadius:2,width:16,height:16,fontSize:11,
                               cursor:"pointer",lineHeight:"1",padding:0}}>+</button>
                         </div>
                       </div>
                     </div>
                     <button onClick={()=>startEdit(p)}
-                      style={{background:"none",border:"none",color:"#1e6fa8",cursor:"pointer",fontSize:12,padding:"1px 3px"}}>✏</button>
+                      style={{background:"none",border:"none",color:T.accentDim,cursor:"pointer",fontSize:12,padding:"1px 3px"}}>✏</button>
                     <button onClick={()=>delPart(p.id)}
                       style={{background:"none",border:"none",color:"#ef444455",cursor:"pointer",fontSize:12,padding:"1px 3px"}}>✕</button>
                   </div>
                 </div>
-              ))}
+              );})}
             </div>
 
-            {/* Add / Edit form */}
-            <div style={{padding:"10px 12px",borderTop:"1px solid #0d2545",background:"#040a15"}}>
-              <span style={{...CAP,color:eid!==null?"#00e5ff":"#1a3a5c"}}>
+            <div style={{padding:"10px 12px",borderTop:`1px solid ${T.border}`,background:T.panelBg2}}>
+              <span style={{...CAP,color:eid!==null?T.accent:T.textMuted}}>
                 {eid!==null ? "◈ РЕДАКТОР" : "◈ НОВАЯ ДЕТАЛЬ"}
               </span>
               <input placeholder="Название" value={form.name}
@@ -1724,7 +1707,7 @@ export default function App() {
                   onChange={e=>setForm(f=>({...f,qty:e.target.value}))} style={inp({width:38})}/>
               </div>
               <label style={{display:"flex",alignItems:"center",gap:5,marginBottom:7,
-                cursor:"pointer",fontSize:10,color:"#1e4a78",
+                cursor:"pointer",fontSize:10,color:T.textTertiary,
                 fontFamily:"'JetBrains Mono',monospace"}}>
                 <input type="checkbox" checked={form.rot}
                   onChange={e=>setForm(f=>({...f,rot:e.target.checked}))}/>
@@ -1732,15 +1715,15 @@ export default function App() {
               </label>
               <div style={{display:"flex",gap:5}}>
                 <button onClick={submitForm}
-                  style={{flex:1,background:"#00e5ff0e",border:"1px solid #00e5ff33",
-                    color:"#00e5ff",borderRadius:2,padding:"5px",cursor:"pointer",
+                  style={{flex:1,background:`${T.accent}12`,border:`1px solid ${T.accent}33`,
+                    color:T.accent,borderRadius:2,padding:"5px",cursor:"pointer",
                     fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
                     fontSize:13,letterSpacing:"0.06em"}}>
                   {eid!==null ? "💾 СОХРАНИТЬ" : "+ ДОБАВИТЬ"}
                 </button>
                 {eid!==null && (
                   <button onClick={cancelEdit}
-                    style={{background:"none",border:"1px solid #0d2545",color:"#1a3a5c",
+                    style={{background:"none",border:`1px solid ${T.border}`,color:T.textMuted,
                       borderRadius:2,padding:"5px 9px",cursor:"pointer",fontSize:11}}>
                     ✕
                   </button>
@@ -1749,13 +1732,11 @@ export default function App() {
             </div>
           </>}
 
-          {/* ═══ НАСТРОЙКИ TAB ════════════════════════════ */}
           {tab === "settings" && (
             <div style={{flex:1,overflowY:"auto",padding:"12px 14px"}}>
 
-              {/* ── Rotation Steps ─────────────────────── */}
               <span style={CAP}>◈ ШАГИ ПОВОРОТА</span>
-              <div style={{fontSize:10,color:"#2a4a68",marginBottom:10,lineHeight:1.6}}>
+              <div style={{fontSize:10,color:T.textTertiary,marginBottom:10,lineHeight:1.6}}>
                 Число дискретных положений при автоподборе угла детали.
                 Применяется к контурам из DXF и деталям с флагом ⟳.
                 Прямоугольные детали всегда используют только 0° и 90°.
@@ -1768,33 +1749,31 @@ export default function App() {
                   <label key={v} style={{
                     display:"flex",alignItems:"center",gap:9,
                     marginBottom:4,cursor:"pointer",padding:"6px 8px",borderRadius:3,
-                    background:active?"#0d2545":"transparent",
-                    border:`1px solid ${active?"#00e5ff44":"transparent"}`,
-                    transition:"all .1s",
+                    background:active?T.rowAlt:"transparent",
+                    border:`1px solid ${active?T.accent+"44":"transparent"}`,
                   }}>
                     <input type="radio" name="rotSteps" checked={active}
                       onChange={()=>{setRotSteps(v);setDirty(true);}}/>
                     <div style={{flex:1}}>
                       <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,
-                        color:active?"#00e5ff":"#2a5080"}}>
+                        color:active?T.accent:T.textTertiary}}>
                         {l}
                       </div>
-                      {/* Dot visualisation */}
                       <div style={{display:"flex",gap:2,marginTop:3,flexWrap:"wrap"}}>
                         {Array.from({length:dotCount},(_,i) => (
                           <div key={i} style={{
                             width:5,height:5,borderRadius:"50%",
-                            background:active?"#00e5ff":"#0d2545",
+                            background:active?T.accent:T.border,
                           }}/>
                         ))}
                         {v > 16 && (
-                          <span style={{fontSize:8,color:"#1a3a5c",lineHeight:"6px"}}>…</span>
+                          <span style={{fontSize:8,color:T.textMuted,lineHeight:"6px"}}>…</span>
                         )}
                       </div>
                     </div>
                     {active && (
                       <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:8,
-                        color:"#00e5ff88",whiteSpace:"nowrap"}}>
+                        color:T.accent+"88",whiteSpace:"nowrap"}}>
                         {(360/v).toFixed(1)}°/шаг
                       </span>
                     )}
@@ -1804,43 +1783,44 @@ export default function App() {
 
               <div style={DIV}/>
 
-              {/* ── Arc Tolerance ──────────────────────── */}
               <span style={CAP}>◈ ТОЧНОСТЬ АППРОКСИМАЦИИ ДУГ</span>
-              <div style={{fontSize:10,color:"#2a4a68",marginBottom:8,lineHeight:1.5}}>
+              <div style={{fontSize:10,color:T.textTertiary,marginBottom:8,lineHeight:1.5}}>
                 Шаг разбивки кривых при импорте DXF (мм).
                 Меньше → точнее форма, медленнее загрузка.
               </div>
               <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
-                <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#1a3a5c"}}>Допуск</span>
+                <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:T.textMuted}}>Допуск</span>
                 <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
-                  color:"#00e5ff",fontWeight:700}}>{arcTol.toFixed(1)} мм</span>
+                  color:T.accent,fontWeight:700}}>{arcTol.toFixed(1)} мм</span>
               </div>
               <input type="range" min={0.1} max={5} step={0.1} value={arcTol}
                 onChange={e=>setArcTol(+e.target.value)}
                 style={{width:"100%",marginBottom:3}}/>
               <div style={{display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:8,color:"#0d2545"}}>0.1 точно</span>
-                <span style={{fontSize:8,color:"#0d2545"}}>5.0 грубо</span>
+                <span style={{fontSize:8,color:T.textDim}}>0.1 точно</span>
+                <span style={{fontSize:8,color:T.textDim}}>5.0 грубо</span>
               </div>
 
               <div style={DIV}/>
 
-              {/* ── Info ───────────────────────────────── */}
-              <div style={{background:"#0d254514",border:"1px solid #0d2545",
+              <div style={{background:T.rowAlt,border:`1px solid ${T.border}`,
                 borderRadius:3,padding:"8px 10px"}}>
                 <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:8,
-                  color:"#1e4a78",marginBottom:5,letterSpacing:"0.1em"}}>ℹ АЛГОРИТМ</div>
-                <div style={{fontSize:9,color:"#1a3a5c",lineHeight:1.7}}>
-                  <b style={{color:"#2a5080"}}>Guillotine BSSF</b> — Best Short Side Fit.<br/>
-                  DXF: LWPOLYLINE (замкн.), CIRCLE, ELLIPSE.<br/>
-                  Полигоны используют {rotSteps} шагов поворота.<br/>
-                  Прямоугольники — только 0° / 90°.
+                  color:T.accentDim,marginBottom:5,letterSpacing:"0.1em"}}>ℹ АЛГОРИТМ</div>
+                <div style={{fontSize:9,color:T.textTertiary,lineHeight:1.7}}>
+                  <b style={{color:T.textPrimary}}>Bottom-Left-Fill + NFP-lite</b><br/>
+                  Точная проверка пересечения полигонов
+                  (edge-intersection), а не bounding-box —
+                  детали корректно нестятся в вогнутые
+                  области соседей, как в Deepnest.<br/>
+                  DXF: LWPOLYLINE, POLYLINE, SPLINE (де Бор),
+                  CIRCLE, ELLIPSE, ARC/LINE (сборка цепочек).<br/>
+                  Полигоны используют {rotSteps} шагов поворота.
                 </div>
               </div>
 
               <div style={DIV}/>
 
-              {/* ── Demo shapes button ─────────────────── */}
               <button onClick={()=>{setTab("parts");addDemoPolygons();}}
                 style={{width:"100%",background:"#a78bfa0a",
                   border:"1px solid #a78bfa33",color:"#a78bfa",
@@ -1853,52 +1833,32 @@ export default function App() {
           )}
         </div>
 
-        {/* ── CENTER ── */}
+        {/* ── CENTER — all sheets on one screen ── */}
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
 
-          {/* Nav toolbar */}
           {show && (
-            <div style={{height:34,...PBG,borderBottom:"1px solid #0d2545",
-              display:"flex",alignItems:"center",padding:"0 10px",gap:8,flexShrink:0}}>
-              {["◀","▶"].map((ch,i) => {
-                const dis = i===0 ? cur===0 : cur>=sheets.length-1;
-                return (
-                  <button key={ch} disabled={dis}
-                    onClick={()=>setCur(s=>i===0?Math.max(0,s-1):Math.min(sheets.length-1,s+1))}
-                    style={{background:"none",
-                      border:`1px solid ${dis?"#0a1e35":"#1a3a5c"}`,
-                      color:dis?"#0a1e35":"#1e6fa8",borderRadius:2,
-                      padding:"1px 8px",cursor:dis?"default":"pointer",
-                      fontSize:11,fontFamily:"'JetBrains Mono',monospace"}}>
-                    {ch}
-                  </button>
-                );
-              })}
-              <span style={{fontFamily:"'JetBrains Mono',monospace",
-                fontSize:11,color:"#1e4a78",minWidth:74}}>
-                [{String(cur+1).padStart(2,"0")}/{String(sheets.length).padStart(2,"0")}]
-              </span>
-              <div style={{width:1,height:16,background:"#0d2545"}}/>
-              <span style={{fontSize:10,color:"#1a3a5c",fontFamily:"'JetBrains Mono',monospace"}}>
-                n=<b style={{color:"#4a8ab5"}}>{curSh?.pl.length||0}</b>
+            <div style={{height:34,...PBG,borderBottom:`1px solid ${T.border}`,
+              display:"flex",alignItems:"center",padding:"0 10px",gap:10,flexShrink:0}}>
+              <span style={{fontSize:10,color:T.textMuted,fontFamily:"'JetBrains Mono',monospace"}}>
+                {sheets.length} {sheets.length===1?"лист":"листов"} · {totalParts} дет.
               </span>
               <span style={{fontSize:10,fontFamily:"'JetBrains Mono',monospace",
-                color:effColor(curEff),fontWeight:700}}>
-                EFF={curEff.toFixed(1)}%
+                color:effColor(eff),fontWeight:700}}>
+                EFF={eff.toFixed(1)}%
               </span>
               <div style={{flex:1}}/>
               <label style={{display:"flex",alignItems:"center",gap:4,cursor:"pointer",
-                fontSize:10,color:"#1a3a5c",fontFamily:"'JetBrains Mono',monospace"}}>
+                fontSize:10,color:T.textMuted,fontFamily:"'JetBrains Mono',monospace"}}>
                 <input type="checkbox" checked={labels} onChange={e=>setLabels(e.target.checked)}/>
                 LBL
               </label>
-              <div style={{width:1,height:16,background:"#0d2545"}}/>
+              <div style={{width:1,height:16,background:T.border}}/>
               <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
-                color:"#00e5ff88",minWidth:42}}>
+                color:T.accent+"88",minWidth:42}}>
                 {(zoom*100).toFixed(0)}%
               </span>
               <button onClick={resetView}
-                style={{background:"none",border:"1px solid #0d2545",color:"#1e6fa8",
+                style={{background:"none",border:`1px solid ${T.border}`,color:T.accentDim,
                   borderRadius:2,padding:"1px 7px",cursor:"pointer",fontSize:10,
                   fontFamily:"'JetBrains Mono',monospace"}}>
                 ⟲ RESET
@@ -1906,9 +1866,8 @@ export default function App() {
             </div>
           )}
 
-          {/* Canvas viewport — zoom with wheel, pan with drag, accept DXF drop */}
           <div ref={canvasRef}
-            style={{flex:1, overflow:"hidden", background:"#020a14",
+            style={{flex:1, overflow:"hidden", background:T.canvasBg,
               cursor:"grab", position:"relative", userSelect:"none"}}
             onWheel={onCanvasWheel}
             onMouseDown={onCanvasMouseDown}
@@ -1919,36 +1878,34 @@ export default function App() {
             onDragLeave={onDragLeave}
             onDrop={onDrop}>
 
-            {/* ── BUSY overlay ── */}
             {busy && (
               <div style={{position:"absolute",inset:0,zIndex:20,
                 display:"flex",alignItems:"center",justifyContent:"center",
-                background:"#020a14",pointerEvents:"none"}}>
+                background:T.canvasBg,pointerEvents:"none"}}>
                 <div style={{textAlign:"center"}}>
-                  <div style={{width:160,height:90,border:"1px solid #0d2545",
+                  <div style={{width:160,height:90,border:`1px solid ${T.border}`,
                     position:"relative",overflow:"hidden",
-                    margin:"0 auto 14px",background:"#030c18"}}>
+                    margin:"0 auto 14px",background:T.sheetBg}}>
                     {Array.from({length:9},(_,i)=>(
                       <div key={i} style={{position:"absolute",left:0,right:0,
-                        top:`${i*11}%`,height:1,background:"#0d2545"}}/>
+                        top:`${i*11}%`,height:1,background:T.border}}/>
                     ))}
                     <div style={{position:"absolute",left:0,right:0,height:2,
-                      background:"linear-gradient(90deg,transparent,#00e5ff,transparent)",
-                      animation:"scan 1.1s linear infinite"}}/>
+                      background:`linear-gradient(90deg,transparent,${T.accent},transparent)`,
+                      animation:"blink 1.1s linear infinite"}}/>
                   </div>
                   <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,
-                    color:"#00e5ff",animation:"blink 1.1s infinite"}}>
-                    OPTIMIZING · {rotSteps} STEPS · {parts.reduce((s,p)=>s+p.qty,0)} PARTS…
+                    color:T.accent,animation:"blink 1.1s infinite"}}>
+                    NFP-LITE PACKING · {rotSteps} STEPS · {parts.reduce((s,p)=>s+p.qty,0)} PARTS…
                   </div>
                 </div>
               </div>
             )}
 
-            {/* ── DIRTY overlay — button must receive clicks → NO pointerEvents:none ── */}
             {!busy && dirty && res && (
               <div style={{position:"absolute",inset:0,zIndex:20,
                 display:"flex",alignItems:"center",justifyContent:"center",
-                background:"#020a1aee"}}>
+                background:T.dimOverlay}}>
                 <div style={{textAlign:"center"}}>
                   <div style={{fontSize:28,marginBottom:10,color:"#f59e0b",
                     animation:"blink 1.5s infinite"}}>⚠</div>
@@ -1968,30 +1925,28 @@ export default function App() {
               </div>
             )}
 
-            {/* ── EMPTY overlay ── */}
             {!busy && !res && (
               <div style={{position:"absolute",inset:0,zIndex:20,
                 display:"flex",alignItems:"center",justifyContent:"center",
                 pointerEvents:"none"}}>
                 <div style={{textAlign:"center",pointerEvents:"auto"}}>
-                  <div style={{width:76,height:76,border:"1px solid #0d2545",
+                  <div style={{width:76,height:76,border:`1px solid ${T.border}`,
                     margin:"0 auto 14px",display:"flex",alignItems:"center",
                     justifyContent:"center"}}>
                     <svg width={44} height={44} viewBox="0 0 44 44" fill="none">
-                      <rect x={4} y={4} width={36} height={36} stroke="#0d2545" strokeWidth={1.5}/>
-                      <rect x={8}  y={11} width={11} height={15} stroke="#1a3a5c" strokeWidth={1}/>
-                      <rect x={25} y={11} width={11} height={7}  stroke="#1a3a5c" strokeWidth={1}/>
-                      <rect x={25} y={22} width={11} height={10} stroke="#1a3a5c" strokeWidth={1}/>
-                      <rect x={8}  y={29} width={11} height={6}  stroke="#1a3a5c" strokeWidth={1}/>
-                      <polygon points="8,11 19,11 19,21" stroke="#1a3a5c" strokeWidth={0.5} fill="none" strokeDasharray="2 2"/>
+                      <rect x={4} y={4} width={36} height={36} stroke={T.border} strokeWidth={1.5}/>
+                      <rect x={8}  y={11} width={11} height={15} stroke={T.borderBright} strokeWidth={1}/>
+                      <rect x={25} y={11} width={11} height={7}  stroke={T.borderBright} strokeWidth={1}/>
+                      <rect x={25} y={22} width={11} height={10} stroke={T.borderBright} strokeWidth={1}/>
+                      <rect x={8}  y={29} width={11} height={6}  stroke={T.borderBright} strokeWidth={1}/>
                     </svg>
                   </div>
                   <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,
-                    fontSize:17,color:"#0d2545",letterSpacing:"0.06em",marginBottom:4}}>
+                    fontSize:17,color:T.border,letterSpacing:"0.06em",marginBottom:4}}>
                     ДОБАВЬТЕ ДЕТАЛИ
                   </div>
-                  <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#0a1e35"}}>
-                    DXF IMPORT · {rotSteps} ROT.STEPS · GUILLOTINE BSSF
+                  <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:T.textDim}}>
+                    DXF IMPORT · {rotSteps} ROT.STEPS · NFP-LITE PACKING
                   </div>
                   <button onClick={()=>{setTab("parts");addDemoPolygons();}}
                     style={{marginTop:12,background:"transparent",
@@ -2005,40 +1960,43 @@ export default function App() {
               </div>
             )}
 
-            {/* ── Zoom hint ── */}
-            {show && (
-              <div style={{position:"absolute",bottom:8,right:12,zIndex:10,
-                fontFamily:"'JetBrains Mono',monospace",fontSize:8,
-                color:"#0d2545",pointerEvents:"none"}}>
-                🖱 колесо — зум · перетащить — пан
-              </div>
-            )}
-
-            {/* ── Transform layer — ONLY SheetSVG, no pointer events needed ── */}
+            {/* Transform layer — ALL sheets flow together, no pagination */}
             <div style={{
-              position:"absolute", top:0, left:0, width:"100%", height:"100%",
+              position:"absolute", top:0, left:0,
               transform:`translate(${panX}px,${panY}px) scale(${zoom})`,
-              transformOrigin:"0 0", pointerEvents:"none",
-              display:"flex", alignItems:"center", justifyContent:"center",
+              transformOrigin:"0 0", pointerEvents: show ? "auto" : "none",
+              display:"flex", flexWrap:"wrap", gap:28, alignContent:"flex-start",
+              maxWidth:"4000px",
             }}>
-              {show && curSh && (
-                <SheetSVG data={curSh} W={W} H={H} sc={sc} labels={labels}/>
-              )}
+              {show && sheets.map((sh) => {
+                const e = sh.pl.reduce((s,p)=>s+p.pw*p.ph,0)/shA*100;
+                return (
+                  <div key={sh.id} style={{display:"flex",flexDirection:"column",gap:4}}>
+                    <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,
+                      color:T.textTertiary,display:"flex",gap:8,alignItems:"baseline"}}>
+                      <span style={{color:T.textPrimary,fontWeight:700}}>Лист {sh.id}</span>
+                      <span>{sh.pl.length} дет.</span>
+                      <span style={{color:effColor(e),fontWeight:700}}>{e.toFixed(1)}%</span>
+                    </div>
+                    <SheetSVG data={sh} W={W} H={H} sc={sc} labels={labels}
+                      T={T} hoveredPid={hoveredPid} onHoverPart={setHoveredPid}/>
+                  </div>
+                );
+              })}
             </div>
-          </div>{/* /canvas viewport */}
+          </div>
         </div>
 
         {/* ── RIGHT PANEL ── */}
-        <div style={{width:188,...PBG,borderLeft:"1px solid #0d2545",
+        <div style={{width:188,...PBG,borderLeft:`1px solid ${T.border}`,
           padding:"10px 12px",overflowY:"auto",flexShrink:0}}>
           {show ? (
             <>
               <span style={CAP}>◈ СТАТИСТИКА</span>
 
-              {/* Donut gauge */}
               <div style={{textAlign:"center",marginBottom:12}}>
                 <svg width={80} height={80} style={{display:"block",margin:"0 auto"}}>
-                  <circle cx={40} cy={40} r={30} fill="none" stroke="#0d2545" strokeWidth={9}/>
+                  <circle cx={40} cy={40} r={30} fill="none" stroke={T.border} strokeWidth={9}/>
                   <circle cx={40} cy={40} r={30} fill="none"
                     stroke={effColor(eff)} strokeWidth={9}
                     strokeDasharray={`${188.5*eff/100} 188.5`}
@@ -2050,12 +2008,12 @@ export default function App() {
                     {Math.round(eff)}%
                   </text>
                 </svg>
-                <div style={{fontSize:9,letterSpacing:"0.12em",color:"#1a3a5c",marginTop:3}}>КПД</div>
+                <div style={{fontSize:9,letterSpacing:"0.12em",color:T.textMuted,marginTop:3}}>КПД</div>
               </div>
 
               {[
                 ["ЛИСТОВ",   sheets.length],
-                ["ДЕТАЛЕЙ",  sheets.reduce((s,sh)=>s+sh.pl.length,0)],
+                ["ДЕТАЛЕЙ",  totalParts],
                 ["S_ЛИСТА",  `${(shA/1e6).toFixed(3)} м²`],
                 ["S_ДЕТ",    `${(totA/1e6).toFixed(3)} м²`],
                 ["ОТХОДЫ",   `${((sheets.length*shA-totA)/1e6).toFixed(3)} м²`],
@@ -2063,35 +2021,32 @@ export default function App() {
                 <div key={k} style={{display:"flex",justifyContent:"space-between",
                   alignItems:"baseline",marginBottom:5}}>
                   <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:8,
-                    letterSpacing:"0.06em",color:"#1a3a5c"}}>{k}</span>
+                    letterSpacing:"0.06em",color:T.textMuted}}>{k}</span>
                   <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,
-                    color:"#7fa8cc",fontWeight:700}}>{v}</span>
+                    color:T.textSecondary,fontWeight:700}}>{v}</span>
                 </div>
               ))}
 
               <div style={DIV}/>
               <span style={CAP}>◈ ЛИСТЫ</span>
 
-              {sheets.map((sh, i) => {
+              {sheets.map((sh) => {
                 const e = sh.pl.reduce((s,p)=>s+p.pw*p.ph,0)/shA*100;
-                const active = i === cur;
                 return (
-                  <div key={i} style={{marginBottom:7,cursor:"pointer"}}
-                    onClick={() => setCur(i)}>
+                  <div key={sh.id} style={{marginBottom:7}}>
                     <div style={{display:"flex",justifyContent:"space-between",
                       alignItems:"center",marginBottom:2}}>
                       <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
-                        fontWeight:active?700:400,
-                        color:active?"#00e5ff":"#1e4a78"}}>
-                        {active?"▶ ":"  "}{String(i+1).padStart(2,"0")}
-                        <span style={{fontSize:8,opacity:.45,marginLeft:3}}>×{sh.pl.length}</span>
+                        color:T.textTertiary}}>
+                        {String(sh.id).padStart(2,"0")}
+                        <span style={{fontSize:8,opacity:.6,marginLeft:3}}>×{sh.pl.length}</span>
                       </span>
                       <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
                         fontWeight:700,color:effColor(e)}}>
                         {e.toFixed(0)}%
                       </span>
                     </div>
-                    <div style={{height:3,background:"#0d2545",borderRadius:1}}>
+                    <div style={{height:3,background:T.border,borderRadius:1}}>
                       <div style={{height:"100%",borderRadius:1,
                         width:`${Math.min(100,e)}%`,background:effColor(e),
                         transition:"width .4s ease"}}/>
@@ -2103,7 +2058,7 @@ export default function App() {
               {res.skipped?.length > 0 && <>
                 <div style={DIV}/>
                 <div style={{border:"1px solid #92400e55",borderRadius:2,
-                  padding:"6px 8px",background:"#1a080066"}}>
+                  padding:"6px 8px",background:"#f59e0b12"}}>
                   <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:8,
                     letterSpacing:"0.1em",color:"#f59e0b",marginBottom:4}}>
                     ⚠ НЕ ВХОДЯТ:
@@ -2119,7 +2074,7 @@ export default function App() {
             </>
           ) : (
             <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,
-              color:"#0d2545",textAlign:"center",marginTop:32,lineHeight:2}}>
+              color:T.border,textAlign:"center",marginTop:32,lineHeight:2}}>
               ОЖИДАНИЕ<br/>РАСЧЁТА…
             </div>
           )}
