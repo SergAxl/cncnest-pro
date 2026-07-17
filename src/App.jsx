@@ -100,6 +100,66 @@ function polygonArea(pts) {
   return Math.abs(a/2);
 }
 
+// ── Polygon edge-intersection primitives (used for both self-intersection
+// repair below and NFP-lite nesting collision further down) ─────────────
+function cross2(o, a, b) {
+  return (a.x-o.x)*(b.y-o.y) - (a.y-o.y)*(b.x-o.x);
+}
+
+function segIntersect(p1,p2,p3,p4) {
+  const d1 = cross2(p3,p4,p1);
+  const d2 = cross2(p3,p4,p2);
+  const d3 = cross2(p1,p2,p3);
+  const d4 = cross2(p1,p2,p4);
+  if (((d1>1e-9&&d2<-1e-9)||(d1<-1e-9&&d2>1e-9)) &&
+      ((d3>1e-9&&d4<-1e-9)||(d3<-1e-9&&d4>1e-9))) return true;
+  return false;
+}
+
+// Count self-intersections in a closed polygon, and how many times each
+// edge participates in one (used to find the "seam" edge to cut at).
+function findPolySelfIntersections(poly) {
+  const n = poly.length;
+  const edgeHits = new Array(n).fill(0);
+  let total = 0;
+  for (let i=0;i<n;i++) {
+    const a1=poly[i], a2=poly[(i+1)%n];
+    for (let j=i+2;j<n;j++) {
+      if (i===0 && j===n-1) continue; // adjacent wrap-around edge, not a crossing
+      const b1=poly[j], b2=poly[(j+1)%n];
+      if (segIntersect(a1,a2,b1,b2)) { edgeHits[i]++; edgeHits[j]++; total++; }
+    }
+  }
+  return { total, edgeHits };
+}
+
+// Some DXF exporters (observed from Deepnest re-exports) occasionally drop
+// a SEQEND marker between two adjacent parts, concatenating their vertex
+// lists into one malformed, self-intersecting POLYLINE. This recursively
+// cuts a self-intersecting contour at the edge most responsible for the
+// crossings, producing valid simple sub-polygons. Contours that are
+// already simple pass through untouched (verified against real files:
+// zero false-positive splits on legitimately complex/zigzag shapes).
+function splitSelfIntersecting(poly, depth=0) {
+  if (poly.length < 3 || depth > 5) return [poly];
+  const { total, edgeHits } = findPolySelfIntersections(poly);
+  if (total === 0) return [poly];
+
+  let worstIdx = 0, worstHits = -1;
+  for (let i=0;i<edgeHits.length;i++)
+    if (edgeHits[i] > worstHits) { worstHits = edgeHits[i]; worstIdx = i; }
+
+  const i = worstIdx;
+  const loopA = poly.slice(0, i+1);
+  const loopB = poly.slice(i+1);
+  if (loopA.length < 3 || loopB.length < 3) return [poly];
+
+  return [
+    ...splitSelfIntersecting(loopA, depth+1),
+    ...splitSelfIntersecting(loopB, depth+1),
+  ];
+}
+
 // Evaluate closed periodic cubic B-spline
 function evalClosedBSpline3(ctrlPts, numPts) {
   const n = ctrlPts.length;
@@ -599,25 +659,31 @@ function parseDXF(text, tol = 1.0) {
     }
   }
 
-  return { shapes, foundTypes };
+  // ── Post-process: repair contours accidentally merged by the source
+  // file (see splitSelfIntersecting docstring above) ────────────────
+  const finalShapes = [];
+  for (const s of shapes) {
+    const parts = splitSelfIntersecting(s.polygon);
+    if (parts.length === 1) {
+      finalShapes.push(s);
+      continue;
+    }
+    for (const p of parts) {
+      const bb = getBBox(p);
+      if (bb.w < 1.5 && bb.h < 1.5) continue;
+      if (polygonArea(p) < 2) continue;
+      finalShapes.push({ ...s, polygon: p, w: bb.w, h: bb.h });
+    }
+  }
+
+  return { shapes: finalShapes, foundTypes };
 }
 
 // ═══════════════════════════════════════════════════════════
 //  POLYGON COLLISION  (NFP-lite — real edge intersection test)
 // ═══════════════════════════════════════════════════════════
-function cross2(o, a, b) {
-  return (a.x-o.x)*(b.y-o.y) - (a.y-o.y)*(b.x-o.x);
-}
-
-function segIntersect(p1,p2,p3,p4) {
-  const d1 = cross2(p3,p4,p1);
-  const d2 = cross2(p3,p4,p2);
-  const d3 = cross2(p1,p2,p3);
-  const d4 = cross2(p1,p2,p4);
-  if (((d1>1e-9&&d2<-1e-9)||(d1<-1e-9&&d2>1e-9)) &&
-      ((d3>1e-9&&d4<-1e-9)||(d3<-1e-9&&d4>1e-9))) return true;
-  return false;
-}
+// cross2 / segIntersect are defined earlier alongside the geometry
+// helpers (shared with the self-intersection repair in parseDXF).
 
 // A, B: absolute-coordinate point arrays. True if the two polygons overlap.
 function polysOverlap(A, B) {
