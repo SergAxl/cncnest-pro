@@ -717,8 +717,13 @@ function buildOrients(angles, part, gap) {
       holePts = (part.holes||[]).map(hole =>
         rotPts(hole, angle).map(pt => ({ x:pt.x-bb.x0, y:pt.y-bb.y0 }))
       );
-      // Simplified copy specifically for collision testing (perf)
-      collisionPts = decimatePoly(polyPts, 50);
+      // Use the SAME full-detail polygon for both rendering and collision
+      // testing. A separate, more aggressively decimated copy previously
+      // caused sharp concave notches to be smoothed away in the collision
+      // check while still being drawn in full on screen — letting two
+      // complex curved parts be placed close enough that their simplified
+      // outlines cleared, but their real (rendered) outlines overlapped.
+      collisionPts = polyPts;
     } else {
       const a = ((angle % 180) + 180) % 180;
       [pw, ph] = (a < 45 || a >= 135) ? [part.w, part.h] : [part.h, part.w];
